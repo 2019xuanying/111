@@ -76,6 +76,7 @@ echo "----------------------------------"
 # =============================
 echo "==== 安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
 # 使用 <<EOF 允许 Bash 变量替换
+# 注意：此处的 Python 代码经过严格检查，确保没有非 ASCII 空格或制表符
 tee /usr/local/bin/wss > /dev/null <<EOF
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
@@ -90,10 +91,10 @@ from datetime import datetime
 
 # 尝试导入 uvloop, 如果没有安装则使用默认 asyncio
 try:
-    import uvloop
-    UVLOOP_AVAILABLE = True
+    import uvloop
+    UVLOOP_AVAILABLE = True
 except ImportError:
-    UVLOOP_AVAILABLE = False
+    UVLOOP_AVAILABLE = False
 
 LISTEN_ADDR = '0.0.0.0'
 
@@ -102,13 +103,13 @@ INTERNAL_FORWARD_PORT_PY = '${INTERNAL_FORWARD_PORT}'
 PANEL_PORT_PY = '${PANEL_PORT}'
 
 try:
-    HTTP_PORT = int(sys.argv[1])
+    HTTP_PORT = int(sys.argv[1])
 except (IndexError, ValueError):
-    HTTP_PORT = 80
+    HTTP_PORT = 80
 try:
-    TLS_PORT = int(sys.argv[2])
+    TLS_PORT = int(sys.argv[2])
 except (IndexError, ValueError):
-    TLS_PORT = 443
+    TLS_PORT = 443
 
 # 使用用户指定的内部转发端口
 DEFAULT_TARGET = ('127.0.0.1', int(INTERNAL_FORWARD_PORT_PY))
@@ -116,7 +117,7 @@ BUFFER_SIZE = 65536
 TIMEOUT = 3600
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
 KEY_FILE = '/etc/stunnel/certs/stunnel.key'
-PANEL_IP_CHECK_API = f"http://127.0.0.1:{PANEL_PORT_PY}/api/ips/check" 
+PANEL_IP_CHECK_API = f"http://127.0.0.1:{PANEL_PORT_PY}/api/ips/check" 
 
 FIRST_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK\r\n\r\n'
 SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
@@ -124,149 +125,149 @@ FORBIDDEN_RESPONSE = b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'
 
 
 async def check_ip_banned(client_ip):
-    """异步检查 IP 是否被面板防火墙规则封禁 (通过访问本地 API)"""
-    try:
-        # WSS 代理的 IP 检查逻辑保持不变
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection('127.0.0.1', int(PANEL_PORT_PY)), 
-            timeout=2
-        )
-        
-        request_body = json.dumps({'ip': client_ip})
-        request_headers = (
-            f"POST /api/ips/check HTTP/1.1\r\n"
-            f"Host: 127.0.0.1:{PANEL_PORT_PY}\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(request_body)}\r\n"
-            f"Connection: close\r\n\r\n"
-        )
-        writer.write(request_headers.encode('utf-8') + request_body.encode('utf-8'))
-        await writer.drain()
-        
-        # We rely on kernel-level IPTables acting as the primary enforcement. 
-        return False
-        
-    except Exception:
-        # 如果面板 API 宕机或超时，则默认允许连接
-        return False
+    """异步检查 IP 是否被面板防火墙规则封禁 (通过访问本地 API)"""
+    try:
+        # WSS 代理的 IP 检查逻辑保持不变
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection('127.0.0.1', int(PANEL_PORT_PY)), 
+            timeout=2
+        )
+        
+        request_body = json.dumps({'ip': client_ip})
+        request_headers = (
+            f"POST /api/ips/check HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{PANEL_PORT_PY}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(request_body)}\r\n"
+            f"Connection: close\r\n\r\n"
+        )
+        writer.write(request_headers.encode('utf-8') + request_body.encode('utf-8'))
+        await writer.drain()
+        
+        # We rely on kernel-level IPTables acting as the primary enforcement. 
+        return False
+        
+    except Exception:
+        # 如果面板 API 宕机或超时，则默认允许连接
+        return False
 
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
-    peer = writer.get_extra_info('peername')
-    client_ip = peer[0]
-    print(f"Connection from {peer} {'(TLS)' if tls else ''}")
-    
-    forwarding_started = False
-    full_request = b''
+    peer = writer.get_extra_info('peername')
+    client_ip = peer[0]
+    print(f"Connection from {peer} {'(TLS)' if tls else ''}")
+    
+    forwarding_started = False
+    full_request = b''
 
-    try:
-        # --- 1. 握手循环 ---
-        while not forwarding_started:
-            data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=TIMEOUT)
-            if not data:
-                break
-            
-            full_request += data
-            
-            header_end_index = full_request.find(b'\r\n\r\n')
-            
-            if header_end_index == -1:
-                writer.write(FIRST_RESPONSE)
-                await writer.drain()
-                full_request = b''
-                continue
+    try:
+        # --- 1. 握手循环 ---
+        while not forwarding_started:
+            data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=TIMEOUT)
+            if not data:
+                break
+            
+            full_request += data
+            
+            header_end_index = full_request.find(b'\r\n\r\n')
+            
+            if header_end_index == -1:
+                writer.write(FIRST_RESPONSE)
+                await writer.drain()
+                full_request = b''
+                continue
 
-            # 2. 头部解析
-            headers_raw = full_request[:header_end_index]
-            data_to_forward = full_request[header_end_index + 4:]
-            headers = headers_raw.decode(errors='ignore')
+            # 2. 头部解析
+            headers_raw = full_request[:header_end_index]
+            data_to_forward = full_request[header_end_index + 4:]
+            headers = headers_raw.decode(errors='ignore')
 
-            is_websocket_request = 'Upgrade: websocket' in headers or 'Connection: Upgrade' in headers or 'GET-RAY' in headers
-            
-            # 3. 转发触发
-            if is_websocket_request:
-                writer.write(SWITCH_RESPONSE)
-                await writer.drain()
-                forwarding_started = True
-            else:
-                writer.write(FIRST_RESPONSE)
-                await writer.drain()
-                full_request = b''
-                continue
-        
-        # --- 退出握手循环 ---
+            is_websocket_request = 'Upgrade: websocket' in headers or 'Connection: Upgrade' in headers or 'GET-RAY' in headers
+            
+            # 3. 转发触发
+            if is_websocket_request:
+                writer.write(SWITCH_RESPONSE)
+                await writer.drain()
+                forwarding_started = True
+            else:
+                writer.write(FIRST_RESPONSE)
+                await writer.drain()
+                full_request = b''
+                continue
+        
+        # --- 退出握手循环 ---
 
-        # 4. 连接目标服务器
-        target = DEFAULT_TARGET
-        target_reader, target_writer = await asyncio.open_connection(*target)
+        # 4. 连接目标服务器
+        target = DEFAULT_TARGET
+        target_reader, target_writer = await asyncio.open_connection(*target)
 
-        # 5. 转发初始数据
-        if data_to_forward:
-            target_writer.write(data_to_forward)
-            await target_writer.drain()
-            
-        # 6. 转发后续数据流
-        async def pipe(src_reader, dst_writer):
-            try:
-                while True:
-                    buf = await asyncio.wait_for(src_reader.read(BUFFER_SIZE), timeout=TIMEOUT)
-                    if not buf:
-                        break
-                    dst_writer.write(buf)
-                    await dst_writer.drain()
-            except asyncio.TimeoutError:
-                pass
-            except Exception:
-                pass
-            finally:
-                dst_writer.close()
+        # 5. 转发初始数据
+        if data_to_forward:
+            target_writer.write(data_to_forward)
+            await target_writer.drain()
+            
+        # 6. 转发后续数据流
+        async def pipe(src_reader, dst_writer):
+            try:
+                while True:
+                    buf = await asyncio.wait_for(src_reader.read(BUFFER_SIZE), timeout=TIMEOUT)
+                    if not buf:
+                        break
+                    dst_writer.write(buf)
+                    await dst_writer.drain()
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                pass
+            finally:
+                dst_writer.close()
 
-        await asyncio.gather(
-            pipe(reader, target_writer),
-            pipe(target_reader, writer)
-        )
+        await asyncio.gather(
+            pipe(reader, target_writer),
+            pipe(target_reader, writer)
+        )
 
-    except Exception as e:
-        print(f"Connection error {peer}: {e}")
-    finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
-        print(f"Closed {peer}")
+    except Exception as e:
+        print(f"Connection error {peer}: {e}")
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+        print(f"Closed {peer}")
 
 async def main():
-    # TLS server setup
-    ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    try:
-        ssl_ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
-        tls_server = await asyncio.start_server(
-            lambda r, w: handle_client(r, w, tls=True), LISTEN_ADDR, TLS_PORT, ssl=ssl_ctx)
-        print(f"Listening on {LISTEN_ADDR}:{TLS_PORT} (TLS)")
-        tls_task = tls_server.serve_forever()
-    except FileNotFoundError:
-        print(f"WARNING: TLS certificate not found at {CERT_FILE}. TLS server disabled.")
-        tls_task = asyncio.sleep(86400) # Keep task running but effectively disabled
-        
-    http_server = await asyncio.start_server(
-        lambda r, w: handle_client(r, w, tls=False), LISTEN_ADDR, HTTP_PORT)
-    
-    print(f"Listening on {LISTEN_ADDR}:{HTTP_PORT} (HTTP payload)")
+    # TLS server setup
+    ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    try:
+        ssl_ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
+        tls_server = await asyncio.start_server(
+            lambda r, w: handle_client(r, w, tls=True), LISTEN_ADDR, TLS_PORT, ssl=ssl_ctx)
+        print(f"Listening on {LISTEN_ADDR}:{TLS_PORT} (TLS)")
+        tls_task = tls_server.serve_forever()
+    except FileNotFoundError:
+        print(f"WARNING: TLS certificate not found at {CERT_FILE}. TLS server disabled.")
+        tls_task = asyncio.sleep(86400) # Keep task running but effectively disabled
+        
+    http_server = await asyncio.start_server(
+        lambda r, w: handle_client(r, w, tls=False), LISTEN_ADDR, HTTP_PORT)
+    
+    print(f"Listening on {LISTEN_ADDR}:{HTTP_PORT} (HTTP payload)")
 
-    async with http_server:
-        await asyncio.gather(
-            tls_task,
-            http_server.serve_forever())
+    async with http_server:
+        await asyncio.gather(
+            tls_task,
+            http_server.serve_forever())
 
 if __name__ == '__main__':
-    try:
-        if UVLOOP_AVAILABLE:
-            uvloop.install()
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("WSS Proxy Stopped.")
-        
+    try:
+        if UVLOOP_AVAILABLE:
+            uvloop.install()
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("WSS Proxy Stopped.")
+        
 EOF
 
 chmod +x /usr/local/bin/wss
@@ -338,7 +339,7 @@ echo "----------------------------------"
 # =============================
 echo "==== 安装 UDPGW ===="
 if [ ! -d "/root/badvpn" ]; then
-    git clone https://github.com/ambrop72/badvpn.git /root/badvpn > /dev/null 2>&1
+    git clone https://github.com/ambrop72/badvpn.git /root/badvpn > /dev/null 2>&1
 fi
 mkdir -p /root/badvpn/badvpn-build
 cd /root/badvpn/badvpn-build
@@ -400,7 +401,7 @@ iptables -F $BLOCK_CHAIN 2>/dev/null || true
 iptables -X $BLOCK_CHAIN 2>/dev/null || true
 
 # 1. 创建并插入 IP 阻断链 (必须在端口开放规则之前)
-iptables -N $BLOCK_CHAIN 2>/dev/null || true 
+iptables -N $BLOCK_CHAIN 2>/dev/null || true 
 iptables -I INPUT 1 -j $BLOCK_CHAIN # 插入到 INPUT 链最前面
 
 # 2. 清理旧的 QUOTA 链和规则 (如果存在)
@@ -628,7 +629,7 @@ def get_port_status(port):
         return 'FAIL'
         
 def get_service_logs(service_name, lines=50):
-    """获取指定服务的 journalctl 日志."""
+    """获取指定服务的 journalctl 日志。"""
     try:
         command = [shutil.which('journalctl') or '/bin/journalctl', '-u', service_name, f'-n', str(lines), '--no-pager', '--utc']
         success, output = safe_run_command(command)
@@ -637,7 +638,7 @@ def get_service_logs(service_name, lines=50):
         return f"日志获取异常: {str(e)}"
 
 def kill_user_sessions(username):
-    """终止给定用户名的所有活跃 SSH 会话."""
+    """终止给定用户名的所有活跃 SSH 会话。"""
     safe_run_command([shutil.which('pkill') or '/usr/bin/pkill', '-u', username])
 
 def manage_ip_iptables(ip, action, chain_name=BLOCK_CHAIN):
@@ -979,7 +980,7 @@ def refresh_all_user_status(users):
 # --- Web 路由所需的渲染函数 ---
 
 def render_dashboard():
-    """手动读取 HTML 文件并进行 Jinja2 渲染."""
+    """手动读取 HTML 文件并进行 Jinja2 渲染。"""
     try:
         # 核心：读取外部 HTML 模板文件
         with open(PANEL_HTML_PATH, 'r', encoding='utf-8') as f:
@@ -1043,38 +1044,38 @@ def login():
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WSS Panel - 登录</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body {{ font-family: sans-serif; background-color: #f4f7f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
-        .container {{ background: white; padding: 30px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1); width: 100%; max-width: 400px; }}
-        h1 {{ text-align: center; color: #1f2937; margin-bottom: 30px; font-weight: 700; font-size: 24px; }}
-        input[type=text], input[type=password] {{ width: 100%; padding: 12px; margin: 10px 0; display: inline-block; border: 1px solid #d1d5db; border-radius: 8px; box-sizing: border-box; transition: all 0.3s; }}
-        input[type=text]:focus, input[type=password]:focus {{ border-color: #4f46e5; outline: 2px solid #a5b4fc; }}
-        button {{ background-color: #4f46e5; color: white; padding: 14px 20px; margin: 15px 0 5px 0; border: none; border-radius: 8px; cursor: pointer; width: 100%; font-size: 16px; font-weight: 600; transition: background-color 0.3s; }}
-        button:hover {{ background-color: #4338ca; }}
-        .error {{ color: #ef4444; background-color: #fee2e2; padding: 10px; border-radius: 6px; text-align: center; margin-bottom: 15px; font-weight: 500; border: 1px solid #fca5a5; }}
-    </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WSS Panel - 登录</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {{ font-family: sans-serif; background-color: #f4f7f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
+        .container {{ background: white; padding: 30px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1); width: 100%; max-width: 400px; }}
+        h1 {{ text-align: center; color: #1f2937; margin-bottom: 30px; font-weight: 700; font-size: 24px; }}
+        input[type=text], input[type=password] {{ width: 100%; padding: 12px; margin: 10px 0; display: inline-block; border: 1px solid #d1d5db; border-radius: 8px; box-sizing: border-box; transition: all 0.3s; }}
+        input[type=text]:focus, input[type=password]:focus {{ border-color: #4f46e5; outline: 2px solid #a5b4fc; }}
+        button {{ background-color: #4f46e5; color: white; padding: 14px 20px; margin: 15px 0 5px 0; border: none; border-radius: 8px; cursor: pointer; width: 100%; font-size: 16px; font-weight: 600; transition: background-color 0.3s; }}
+        button:hover {{ background-color: #4338ca; }}
+        .error {{ color: #ef4444; background-color: #fee2e2; padding: 10px; border-radius: 6px; text-align: center; margin-bottom: 15px; font-weight: 500; border: 1px solid #fca5a5; }}
+    </style>
 </head>
 <body>
-    <div class="container">
-        <h1>WSS 管理面板 V2</h1>
-        {f'<div class="error">{error}</div>' if error else ''}
-        <form method="POST">
-            <label for="username"><b>用户名</b></label>
-            <input type="text" placeholder="输入 {ROOT_USERNAME}" name="username" value="{ROOT_USERNAME}" required>
+    <div class="container">
+        <h1>WSS 管理面板 V2</h1>
+        {f'<div class="error">{error}</div>' if error else ''}
+        <form method="POST">
+            <label for="username"><b>用户名</b></label>
+            <input type="text" placeholder="输入 {ROOT_USERNAME}" name="username" value="{ROOT_USERNAME}" required>
 
-            <label for="password"><b>密码</b></label>
-            <input type="password" placeholder="输入密码" name="password" required>
+            <label for="password"><b>密码</b></label>
+            <input type="password" placeholder="输入密码" name="password" required>
 
-            <button type="submit">登录</button>
-        </form>
-    </div>
+            <button type="submit">登录</button>
+        </form>
+    </div>
 </body>
 </html>
-    """
+    """
     return make_response(html)
 
 @app.route('/logout')
@@ -1483,888 +1484,955 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WSS 隧道管理面板 - 重构版 V2</title>
-    <!-- 引入 Tailwind CSS CDN -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
-        body { font-family: 'Inter', sans-serif; background-color: #f8fafc; }
-        .card { transition: all 0.3s ease; }
-        .card:hover { transform: translateY(-2px); box-shadow: 0 10px 15px rgba(0,0,0,0.05); }
-        .modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.5); z-index: 1000; display: none; justify-content: center; align-items: center; }
-        .log-pre { font-family: monospace; font-size: 0.8rem; white-space: pre; overflow-x: auto; max-height: 200px; }
-        .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
-        .status-active { background-color: #10b981; }
-        .status-paused { background-color: #f59e0b; }
-        .status-expired { background-color: #ef4444; }
-        /* 强制模态框内容居中显示 */
-        .modal > div { max-width: 90%; }
-        /* IP 封禁状态样式 */
-        .ip-banned-tag { background-color: #fca5a5; color: #dc2626; font-weight: 600; }
-        /* 侧边栏和主内容区域的布局 */
-        .main-layout { display: flex; min-height: calc(100vh - 72px); }
-        .sidebar { width: 250px; background-color: #ffffff; box-shadow: 2px 0 5px rgba(0,0,0,0.05); }
-        .content { flex-grow: 1; }
-    </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WSS 隧道管理面板 - 重构版 V2</title>
+    <!-- 引入 Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* 保持字体引入，使用 Inter */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        
+        /* 仅保留功能性/不可替代的样式 */
+        .log-pre { font-family: monospace; font-size: 0.8rem; white-space: pre; overflow-x: auto; max-height: 200px; }
+        .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+        .status-active { background-color: #10b981; } /* Tailwind: green-500 */
+        .status-paused { background-color: #f59e0b; } /* Tailwind: amber-500 */
+        .status-expired { background-color: #ef4444; } /* Tailwind: red-500 */
+        .ip-banned-tag { background-color: #fca5a5; color: #dc2626; font-weight: 600; } /* Tailwind: red-300 / red-700 */
+
+        /* 优化主布局：使用 calc(100vh - header_height) 确保内容区域滚动 */
+        .main-content-area {
+            min-height: calc(100vh - 72px); /* 72px is the header height (py-4 + text-size) */
+        }
+        
+        /* 覆盖旧版 CSS 避免冲突 */
+        .card { transition: all 0.3s ease; }
+        .card:hover { transform: translateY(-2px); box-shadow: 0 10px 15px rgba(0,0,0,0.05); }
+        .modal { position: fixed; inset: 0; background-color: rgba(0, 0, 0, 0.5); z-index: 1000; display: none; justify-content: center; align-items: center; }
+        .modal > div { max-width: 90%; }
+        
+    </style>
 </head>
-<body class="min-h-screen">
+<body class="min-h-screen bg-gray-50">
 
-    <!-- Header / 导航栏 -->
-    <header class="bg-indigo-700 shadow-lg sticky top-0 z-10">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
-            <h1 class="text-2xl font-bold text-white tracking-wide">WSS 隧道管理面板 (V2 重构版)</h1>
-            <button onclick="logout()" class="bg-red-500 hover:bg-red-600 text-white font-semibold py-2 px-4 rounded-lg transition duration-200 shadow-md">
-                退出登录
-            </button>
-        </div>
-    </header>
+    <!-- Header / 导航栏 -->
+    <header class="bg-indigo-700 shadow-lg sticky top-0 z-20">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+            <h1 class="text-2xl font-bold text-white tracking-wide">WSS 隧道管理面板 (V2 重构版)</h1>
+            <button onclick="logout()" class="bg-red-500 hover:bg-red-600 text-white font-semibold py-2 px-4 rounded-lg transition duration-200 shadow-md">
+                退出登录
+            </button>
+        </div>
+    </header>
 
-    <!-- 主布局：侧边栏 + 内容区 -->
-    <div class="main-layout max-w-7xl mx-auto">
-        <!-- 侧边栏 -->
-        <aside class="sidebar p-4 sticky top-[72px] h-full hidden md:block">
-            <nav class="space-y-2">
-                <a href="#dashboard" onclick="switchView('dashboard')" class="block p-3 rounded-lg text-indigo-700 font-semibold bg-indigo-50 hover:bg-indigo-100 transition">
-                    📊 仪表盘 (Dashboard)
-                </a>
-                <a href="#users" onclick="switchView('users')" class="block p-3 rounded-lg text-gray-700 font-semibold hover:bg-gray-100 transition">
-                    👤 用户管理
-                </a>
-                <a href="#settings" onclick="switchView('settings')" class="block p-3 rounded-lg text-gray-700 font-semibold hover:bg-gray-100 transition">
-                    🛠️ 系统配置/日志
-                </a>
-                <a href="#security" onclick="switchView('security')" class="block p-3 rounded-lg text-gray-700 font-semibold hover:bg-gray-100 transition">
-                    🔒 安全/IP 封禁列表
-                </a>
-            </nav>
-        </aside>
+    <!-- 主布局：侧边栏 + 内容区 -->
+    <div class="main-content-area max-w-7xl mx-auto flex">
+        <!-- 侧边栏 (w-64, sticky) -->
+        <aside class="w-64 bg-white shadow-xl flex-shrink-0 sticky top-[72px] h-[calc(100vh-72px)] overflow-y-auto hidden md:block border-r border-gray-100">
+            <nav class="p-4 space-y-2">
+                <!-- 导航链接：使用 ID 进行 JS 切换 -->
+                <a onclick="switchView('dashboard')" class="block p-3 rounded-xl cursor-pointer text-indigo-700 font-semibold bg-indigo-100 hover:bg-indigo-200 transition duration-150" id="nav-dashboard">
+                    📊 仪表盘 (Dashboard)
+                </a>
+                <a onclick="switchView('users')" class="block p-3 rounded-xl cursor-pointer text-gray-700 font-semibold hover:bg-gray-100 transition duration-150" id="nav-users">
+                    👤 用户管理
+                </a>
+                <a onclick="switchView('settings')" class="block p-3 rounded-xl cursor-pointer text-gray-700 font-semibold hover:bg-gray-100 transition duration-150" id="nav-settings">
+                    🛠️ 系统配置/日志
+                </a>
+                <a onclick="switchView('security')" class="block p-3 rounded-xl cursor-pointer text-gray-700 font-semibold hover:bg-gray-100 transition duration-150" id="nav-security">
+                    🔒 安全/IP 封禁列表
+                </a>
+            </nav>
+        </aside>
 
-        <!-- 内容区域 -->
-        <main class="content p-4 sm:p-6 lg:p-8">
-            
-            <!-- 全局状态信息/警告 -->
-            <div id="status-message" class="hidden p-4 mb-6 rounded-xl font-medium border-l-4" role="alert"></div>
+        <!-- 内容区域 -->
+        <main class="flex-grow p-4 sm:p-6 lg:p-8">
+            
+            <!-- 移动端导航选择器 (新增响应式组件) -->
+            <div class="block md:hidden mb-6">
+                <label for="mobile-view-select" class="sr-only">选择视图</label>
+                <select id="mobile-view-select" onchange="switchView(this.value)" class="w-full p-3 border border-gray-300 rounded-lg bg-white text-gray-700 font-semibold focus:ring-indigo-500 focus:border-indigo-500 shadow-sm">
+                    <option value="dashboard">📊 仪表盘 (Dashboard)</option>
+                    <option value="users">👤 用户管理</option>
+                    <option value="settings">🛠️ 系统配置/日志</option>
+                    <option value="security">🔒 安全/IP 封禁列表</option>
+                </select>
+            </div>
+            
+            <!-- 全局状态信息/警告 -->
+            <div id="status-message" class="hidden p-4 mb-6 rounded-xl font-medium border-l-4" role="alert"></div>
 
-            <!-- 1. 仪表盘视图 (默认显示) -->
-            <div id="view-dashboard">
-                <!-- 实时系统状态卡片 -->
-                <section class="mb-8">
-                    <h2 class="text-xl font-semibold text-gray-700 mb-4">核心基础设施状态</h2>
-                    <div id="system-status-grid" class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
-                        <!-- 动态加载系统和组件状态 -->
-                        <p class="text-gray-500 col-span-6">正在加载系统状态...</p>
-                    </div>
-                </section>
-                
-                <!-- 端口状态和核心操作 -->
-                <section class="card bg-white p-6 rounded-xl shadow-lg mb-8">
-                    <h2 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">服务端口与控制</h2>
-                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-                        <div id="port-status-data" class="md:col-span-1 p-4 bg-gray-50 rounded-lg space-y-2 text-sm">
-                            <!-- 端口列表（动态加载） -->
-                            <p class="text-gray-500">正在检查端口状态...</p>
-                        </div>
-                        <div class="md:col-span-2 space-y-3">
-                            <button onclick="confirmAction('wss', 'restart', null, 'serviceControl', '重启 WSS')" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-lg transition duration-200">
-                                重启 WSS Proxy ({{ WSS_HTTP_PORT }}/{{ WSS_TLS_PORT }})
-                            </button>
-                            <button onclick="confirmAction('stunnel4', 'restart', null, 'serviceControl', '重启 Stunnel4')" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-lg transition duration-200">
-                                重启 Stunnel4 ({{ STUNNEL_PORT }})
-                            </button>
-                            <button onclick="confirmAction('udpgw', 'restart', null, 'serviceControl', '重启 UDPGW')" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-lg transition duration-200">
-                                重启 UDPGW ({{ UDPGW_PORT }})
-                            </button>
-                            <button onclick="confirmAction('wss_panel', 'restart', null, 'serviceControl', '重启面板')" class="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-3 rounded-lg transition duration-200">
-                                重启 Web Panel ({{ PANEL_PORT }})
-                            </button>
-                        </div>
-                    </div>
-                </section>
-                
-                <!-- 快速用户统计（可作为仪表盘卡片） -->
-                <section class="mb-8">
-                    <h2 class="text-xl font-semibold text-gray-700 mb-4">用户快速统计</h2>
-                    <div id="user-quick-stats" class="grid grid-cols-2 md:grid-cols-4 gap-4">
-                        <!-- 动态加载用户总数、活跃数等 -->
-                    </div>
-                </section>
-            </div>
+            <!-- 1. 仪表盘视图 (默认显示) -->
+            <div id="view-dashboard">
+                <!-- 实时系统状态卡片 -->
+                <section class="mb-8">
+                    <h2 class="text-xl font-semibold text-gray-700 mb-4">核心基础设施状态</h2>
+                    <div id="system-status-grid" class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
+                        <!-- 动态加载系统和组件状态 -->
+                        <p class="text-gray-500 col-span-full">正在加载系统状态...</p>
+                    </div>
+                </section>
+                
+                <!-- 端口状态和核心操作 -->
+                <section class="card bg-white p-6 rounded-xl shadow-lg mb-8">
+                    <h2 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">服务端口与控制</h2>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                        <div id="port-status-data" class="md:col-span-1 p-4 bg-gray-50 rounded-lg space-y-2 text-sm border">
+                            <!-- 端口列表（动态加载） -->
+                            <p class="text-gray-500">正在检查端口状态...</p>
+                        </div>
+                        <!-- 服务控制按钮：在小屏幕上，按钮会通过 space-y-3 垂直堆叠 -->
+                        <div class="md:col-span-2 space-y-3">
+                            <button onclick="confirmAction('wss', 'restart', null, 'serviceControl', '重启 WSS')" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-lg transition duration-200 shadow-md">
+                                重启 WSS Proxy ({{ WSS_HTTP_PORT }}/{{ WSS_TLS_PORT }})
+                            </button>
+                            <button onclick="confirmAction('stunnel4', 'restart', null, 'serviceControl', '重启 Stunnel4')" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-lg transition duration-200 shadow-md">
+                                重启 Stunnel4 ({{ STUNNEL_PORT }})
+                            </button>
+                            <button onclick="confirmAction('udpgw', 'restart', null, 'serviceControl', '重启 UDPGW')" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-lg transition duration-200 shadow-md">
+                                重启 UDPGW ({{ UDPGW_PORT }})
+                            </button>
+                            <button onclick="confirmAction('wss_panel', 'restart', null, 'serviceControl', '重启面板')" class="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-3 rounded-lg transition duration-200 shadow-md">
+                                重启 Web Panel ({{ PANEL_PORT }})
+                            </button>
+                        </div>
+                    </div>
+                </section>
+                
+                <!-- 快速用户统计（可作为仪表盘卡片） -->
+                <section class="mb-8">
+                    <h2 class="text-xl font-semibold text-gray-700 mb-4">用户快速统计</h2>
+                    <div id="user-quick-stats" class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
+                        <!-- 动态加载用户总数、活跃数等 -->
+                    </div>
+                </section>
+            </div>
 
-            <!-- 2. 用户管理视图 -->
-            <div id="view-users" class="hidden">
-                <h2 class="text-2xl font-bold text-gray-800 mb-6">👤 用户管理</h2>
-                
-                <!-- 新增用户表单 -->
-                <section class="card bg-white p-6 rounded-xl shadow-lg mb-8">
-                    <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">新增 SSH 隧道用户</h3>
-                    <form id="add-user-form" class="grid grid-cols-1 md:grid-cols-6 gap-4 items-end">
-                        <input type="text" id="new-username" placeholder="用户名 (Username)" required
-                               class="col-span-2 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
-                        <input type="password" id="new-password" placeholder="密码 (Password)" required
-                               class="col-span-2 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
-                        <input type="number" id="expiration-days" value="365" min="1" placeholder="有效期 (天)" required
-                               class="col-span-1 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
-                        <button type="submit" class="col-span-1 bg-green-600 hover:bg-green-700 text-white font-bold py-3 rounded-lg transition duration-200">
-                            创建用户
-                        </button>
-                    </form>
-                    <!-- 批量操作按钮 -->
-                    <button onclick="openModal('batch-modal')" class="mt-4 bg-purple-500 hover:bg-purple-600 text-white font-bold py-2 px-4 rounded-lg transition duration-200 text-sm">
-                        批量操作 / 续期 (待实现)
-                    </button>
-                </section>
-                
-                <!-- 用户列表 -->
-                <section class="card bg-white p-6 rounded-xl shadow-lg">
-                    <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">现有用户列表</h3>
-                    <div class="overflow-x-auto border border-gray-200 rounded-lg">
-                        <table class="min-w-full divide-y divide-gray-200">
-                            <thead class="bg-gray-50">
-                                <tr>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">用户</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">状态</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">到期日</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">流量用量/限额</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">实时速度</th>
-                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider min-w-[280px]">操作</th>
-                                </tr>
-                            </thead>
-                            <tbody id="user-list-tbody" class="bg-white divide-y divide-gray-200">
-                                <!-- 动态加载用户列表 -->
-                            </tbody>
-                        </table>
-                    </div>
-                </section>
-            </div>
-            
-            <!-- 3. 系统配置/日志视图 -->
-            <div id="view-settings" class="hidden">
-                <h2 class="text-2xl font-bold text-gray-800 mb-6">🛠️ 系统配置/日志</h2>
+            <!-- 2. 用户管理视图 -->
+            <div id="view-users" class="hidden">
+                <h2 class="text-2xl font-bold text-gray-800 mb-6">👤 用户管理</h2>
+                
+                <!-- 新增用户表单 -->
+                <section class="card bg-white p-6 rounded-xl shadow-lg mb-8">
+                    <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">新增 SSH 隧道用户</h3>
+                    <form id="add-user-form" class="grid grid-cols-1 md:grid-cols-6 gap-4 items-end">
+                        <input type="text" id="new-username" placeholder="用户名 (Username)" required
+                               class="md:col-span-2 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                        <input type="password" id="new-password" placeholder="密码 (Password)" required
+                               class="md:col-span-2 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                        <input type="number" id="expiration-days" value="365" min="1" placeholder="有效期 (天)" required
+                               class="md:col-span-1 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                        <button type="submit" class="md:col-span-1 bg-green-600 hover:bg-green-700 text-white font-bold py-3 rounded-lg transition duration-200 shadow-md">
+                            创建用户
+                        </button>
+                    </form>
+                    <!-- 批量操作按钮 -->
+                    <button onclick="openModal('batch-modal')" class="mt-4 bg-purple-500 hover:bg-purple-600 text-white font-bold py-2 px-4 rounded-lg transition duration-200 text-sm shadow-md">
+                        批量操作 / 续期 (待实现)
+                    </button>
+                </section>
+                
+                <!-- 用户列表 -->
+                <section class="card bg-white p-6 rounded-xl shadow-lg">
+                    <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">现有用户列表</h3>
+                    <div class="overflow-x-auto border border-gray-200 rounded-lg">
+                        <table class="min-w-full divide-y divide-gray-200">
+                            <thead class="bg-gray-50">
+                                <tr>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">用户</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">状态</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">到期日</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">流量用量/限额</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">实时速度</th>
+                                    <!-- FIX: 移除 min-w 约束，让宽度自适应 -->
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="user-list-tbody" class="bg-white divide-y divide-gray-200">
+                                <!-- 动态加载用户列表 -->
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+            
+            <!-- 3. 系统配置/日志视图 -->
+            <div id="view-settings" class="hidden">
+                <h2 class="text-2xl font-bold text-gray-800 mb-6">🛠️ 系统配置/日志</h2>
 
-                <section class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                    <div class="card bg-white p-6 rounded-xl shadow-lg">
-                        <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">核心服务日志 (最新 50 行)</h3>
-                        <div class="space-y-4">
-                            <div class="flex space-x-2 flex-wrap">
-                                <button onclick="fetchServiceLogs('wss')" class="bg-gray-200 hover:bg-gray-300 px-3 py-1 text-sm rounded-lg mb-2">WSS Proxy</button>
-                                <button onclick="fetchServiceLogs('stunnel4')" class="bg-gray-200 hover:bg-gray-300 px-3 py-1 text-sm rounded-lg mb-2">Stunnel4</button>
-                                <button onclick="fetchServiceLogs('udpgw')" class="bg-gray-200 hover:bg-gray-300 px-3 py-1 text-sm rounded-lg mb-2">UDPGW</button>
-                                <button onclick="fetchServiceLogs('wss_panel')" class="bg-gray-200 hover:bg-gray-300 px-3 py-1 text-sm rounded-lg mb-2">Web Panel</button>
-                            </div>
-                            <div class="bg-gray-800 text-gray-200 p-3 rounded-lg">
-                                <pre id="service-log-content" class="log-pre">请选择服务加载日志...</pre>
-                        </div>
-                    </div>
-                    
-                    <div class="card bg-white p-6 rounded-xl shadow-lg">
-                        <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">管理员审计日志 (最新活动)</h3>
-                        <div class="bg-gray-100 p-3 rounded-lg max-h-[300px] overflow-y-auto">
-                             <div id="audit-log-content" class="text-xs text-gray-700 space-y-1">正在加载审计日志...</div>
-                        </div>
-                    </div>
-                </section>
-            </div>
-            
-            <!-- 4. 安全/IP 封禁列表视图 -->
-            <div id="view-security" class="hidden">
-                <h2 class="text-2xl font-bold text-gray-800 mb-6">🔒 全局 IP 封禁管理</h2>
+                <section class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div class="card bg-white p-6 rounded-xl shadow-lg">
+                        <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">核心服务日志 (最新 50 行)</h3>
+                        <div class="space-y-4">
+                            <div class="flex space-x-2 flex-wrap">
+                                <button onclick="fetchServiceLogs('wss')" class="bg-gray-200 hover:bg-gray-300 px-3 py-1 text-sm rounded-lg mb-2 shadow-sm">WSS Proxy</button>
+                                <button onclick="fetchServiceLogs('stunnel4')" class="bg-gray-200 hover:bg-gray-300 px-3 py-1 text-sm rounded-lg mb-2 shadow-sm">Stunnel4</button>
+                                <button onclick="fetchServiceLogs('udpgw')" class="bg-gray-200 hover:bg-gray-300 px-3 py-1 text-sm rounded-lg mb-2 shadow-sm">UDPGW</button>
+                                <button onclick="fetchServiceLogs('wss_panel')" class="bg-gray-200 hover:bg-gray-300 px-3 py-1 text-sm rounded-lg mb-2 shadow-sm">Web Panel</button>
+                            </div>
+                            <div class="bg-gray-800 text-gray-200 p-3 rounded-lg overflow-hidden border border-gray-700">
+                                <pre id="service-log-content" class="log-pre">请选择服务加载日志...</pre>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="card bg-white p-6 rounded-xl shadow-lg">
+                        <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">管理员审计日志 (最新活动)</h3>
+                        <div class="bg-gray-100 p-3 rounded-lg max-h-[300px] overflow-y-auto border">
+                             <div id="audit-log-content" class="text-xs text-gray-700 space-y-1">正在加载审计日志...</div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+            
+            <!-- 4. 安全/IP 封禁列表视图 -->
+            <div id="view-security" class="hidden">
+                <h2 class="text-2xl font-bold text-gray-800 mb-6">🔒 全局 IP 封禁管理</h2>
 
-                <section class="card bg-white p-6 rounded-xl shadow-lg mb-8">
-                    <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">IPTables 全局封禁 IP 列表</h3>
-                    <div id="global-ban-list" class="space-y-3 max-h-96 overflow-y-auto p-3 bg-gray-50 rounded-lg border">
-                        <p class="text-gray-500">正在加载全局 IP 封禁列表...</p>
-                    </div>
-                </section>
-                
-                <section class="card bg-white p-6 rounded-xl shadow-lg">
-                    <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">新增全局封禁 IP</h3>
-                    <form id="add-global-ban-form" class="flex space-x-4">
-                        <input type="text" id="global-ban-ip" placeholder="输入要封禁的 IP 地址" required
-                               class="flex-1 p-3 border border-gray-300 rounded-lg focus:ring-red-500 focus:border-red-500">
-                        <button type="submit" class="bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-6 rounded-lg transition duration-200">
-                            全局封禁
-                        </button>
-                    </form>
-                </section>
-            </div>
+                <section class="card bg-white p-6 rounded-xl shadow-lg mb-8">
+                    <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">IPTables 全局封禁 IP 列表</h3>
+                    <div id="global-ban-list" class="space-y-3 max-h-96 overflow-y-auto p-3 bg-gray-50 rounded-lg border">
+                        <p class="text-gray-500">正在加载全局 IP 封禁列表...</p>
+                    </div>
+                </section>
+                
+                <section class="card bg-white p-6 rounded-xl shadow-lg">
+                    <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">新增全局封禁 IP</h3>
+                    <form id="add-global-ban-form" class="flex flex-col sm:flex-row space-y-4 sm:space-y-0 sm:space-x-4">
+                        <input type="text" id="global-ban-ip" placeholder="输入要封禁的 IP 地址" required
+                               class="flex-1 p-3 border border-gray-300 rounded-lg focus:ring-red-500 focus:border-red-500">
+                        <button type="submit" class="bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-6 rounded-lg transition duration-200 shadow-md flex-shrink-0">
+                            全局封禁
+                        </button>
+                    </form>
+                </section>
+            </div>
 
-        </main>
-    </div>
+        </main>
+    </div>
 
-    <!-- 模态框：设置用户配额/速度/密码/有效期 -->
-    <div id="settings-modal" class="modal">
-        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-lg">
-            <h3 class="text-xl font-bold text-gray-800 mb-4 border-b pb-2">设置 <span id="modal-username-title" class="text-indigo-600"></span> 的参数</h3>
-            <form id="settings-form" onsubmit="event.preventDefault(); saveUserSettings();">
-                <input type="hidden" id="modal-username-setting">
-                
-                <div class="space-y-4">
-                    <div>
-                        <label for="modal-expiry-date" class="block text-sm font-medium text-gray-700 mb-1">到期日期 (YYYY-MM-DD, 永不留空)</label>
-                        <input type="date" id="modal-expiry-date" class="w-full p-3 border border-gray-300 rounded-lg">
-                    </div>
-                    
-                    <div class="grid grid-cols-2 gap-4">
-                        <div>
-                            <label for="modal-quota-gb" class="block text-sm font-medium text-gray-700 mb-1">流量限额 (GB, 0=无限制)</label>
-                            <input type="number" id="modal-quota-gb" min="0" required class="w-full p-3 border border-gray-300 rounded-lg">
-                        </div>
-                        <div>
-                            <label for="modal-rate-kbps" class="block text-sm font-medium text-gray-700 mb-1">最大速度 (KB/s, 0=无限制)</label>
-                            <input type="number" id="modal-rate-kbps" min="0" required class="w-full p-3 border border-gray-300 rounded-lg">
-                        </div>
-                    </div>
+    <!-- 模态框：设置用户配额/速度/密码/有效期 -->
+    <div id="settings-modal" class="fixed inset-0 bg-gray-900 bg-opacity-50 z-[1000] hidden justify-center items-center">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-lg transition duration-300 transform scale-100">
+            <h3 class="text-xl font-bold text-gray-800 mb-4 border-b pb-2">设置 <span id="modal-username-title" class="text-indigo-600"></span> 的参数</h3>
+            <form id="settings-form" onsubmit="event.preventDefault(); saveUserSettings();">
+                <input type="hidden" id="modal-username-setting">
+                
+                <div class="space-y-4">
+                    <div>
+                        <label for="modal-expiry-date" class="block text-sm font-medium text-gray-700 mb-1">到期日期 (YYYY-MM-DD, 永不留空)</label>
+                        <input type="date" id="modal-expiry-date" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                    </div>
+                    
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                            <label for="modal-quota-gb" class="block text-sm font-medium text-gray-700 mb-1">流量限额 (GB, 0=无限制)</label>
+                            <input type="number" id="modal-quota-gb" min="0" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                        </div>
+                        <div>
+                            <label for="modal-rate-kbps" class="block text-sm font-medium text-gray-700 mb-1">最大速度 (KB/s, 0=无限制)</label>
+                            <input type="number" id="modal-rate-kbps" min="0" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                        </div>
+                    </div>
 
-                    <div class="border-t pt-4">
-                        <label for="modal-new-password" class="block text-sm font-medium text-gray-700 mb-1">修改密码 (选填)</label>
-                        <input type="password" id="modal-new-password" placeholder="留空则不修改" class="w-full p-3 border border-gray-300 rounded-lg">
-                        <p class="text-xs text-gray-500 mt-1">注意：修改密码后，所有该用户当前活跃的连接将被强制断开。</p>
-                    </div>
-                </div>
+                    <div class="border-t pt-4">
+                        <label for="modal-new-password" class="block text-sm font-medium text-gray-700 mb-1">修改密码 (选填)</label>
+                        <input type="password" id="modal-new-password" placeholder="留空则不修改" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                        <p class="text-xs text-gray-500 mt-1">注意：修改密码后，所有该用户当前活跃的连接将被强制断开。</p>
+                    </div>
+                </div>
 
-                <div class="mt-6 flex justify-between">
-                    <button type="button" onclick="confirmAction(document.getElementById('modal-username-setting').value, null, null, 'resetTraffic', '重置流量')" 
-                          class="bg-yellow-500 hover:bg-yellow-600 text-white font-semibold py-2 px-4 rounded-lg">重置流量</button>
-                    <div class="flex space-x-3">
-                        <button type="button" onclick="closeModal('settings-modal')" class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-semibold py-2 px-4 rounded-lg">取消</button>
-                        <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2 px-4 rounded-lg">保存设置</button>
-                    </div>
-                </div>
-            </form>
-        </div>
-    </div>
-    
-    <!-- 模态框：IP 活跃度与封禁控制 -->
-    <div id="ip-activity-modal" class="modal">
-        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-2xl">
-            <h3 class="text-xl font-bold text-gray-800 mb-4 border-b pb-2">用户 <span id="ip-modal-username-title" class="text-indigo-600"></span> 活跃 IP</h3>
-            
-            <div class="text-sm text-gray-600 mb-4">
-                <p>实时 IP 数据源于底层连接追踪。流量和封禁操作将实时生效。</p>
-            </div>
+                <div class="mt-6 flex justify-between">
+                    <button type="button" onclick="confirmAction(document.getElementById('modal-username-setting').value, null, null, 'resetTraffic', '重置流量')" 
+                            class="bg-yellow-500 hover:bg-yellow-600 text-white font-semibold py-2 px-4 rounded-lg shadow-md transition duration-200">重置流量</button>
+                    <div class="flex space-x-3">
+                        <button type="button" onclick="closeModal('settings-modal')" class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-semibold py-2 px-4 rounded-lg shadow-md transition duration-200">取消</button>
+                        <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2 px-4 rounded-lg shadow-md transition duration-200">保存设置</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <!-- 模态框：IP 活跃度与封禁控制 -->
+    <div id="ip-activity-modal" class="fixed inset-0 bg-gray-900 bg-opacity-50 z-[1000] hidden justify-center items-center">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-2xl transition duration-300 transform scale-100">
+            <h3 class="text-xl font-bold text-gray-800 mb-4 border-b pb-2">用户 <span id="ip-modal-username-title" class="text-indigo-600"></span> 活跃 IP</h3>
+            
+            <div class="text-sm text-gray-600 mb-4">
+                <p>实时 IP 数据源于底层连接追踪。流量和封禁操作将实时生效。</p>
+            </div>
 
-            <!-- IP 列表容器 -->
-            <div id="active-ip-list" class="space-y-3 max-h-96 overflow-y-auto p-3 bg-gray-50 rounded-lg border">
-                <p class="text-gray-500">正在加载 IP 数据...</p>
-            </div>
-            
-            <div class="mt-6 flex justify-between">
-                <button onclick="confirmAction(document.getElementById('ip-modal-username-title').textContent, null, null, 'killAll', '强制断开所有')" 
-                        class="bg-red-500 hover:bg-red-600 text-white font-semibold py-2 px-4 rounded-lg text-sm">
-                        强制断开所有连接
-                </button>
-                <button type="button" onclick="closeModal('ip-activity-modal')" class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-semibold py-2 px-4 rounded-lg">关闭</button>
-            </div>
-        </div>
-    </div>
+            <!-- IP 列表容器 -->
+            <div id="active-ip-list" class="space-y-3 max-h-96 overflow-y-auto p-3 bg-gray-50 rounded-lg border">
+                <p class="text-gray-500">正在加载 IP 数据...</p>
+            </div>
+            
+            <div class="mt-6 flex justify-between">
+                <button onclick="confirmAction(document.getElementById('ip-modal-username-title').textContent, null, null, 'killAll', '强制断开所有')" 
+                        class="bg-red-500 hover:bg-red-600 text-white font-semibold py-2 px-4 rounded-lg text-sm shadow-md transition duration-200">
+                        强制断开所有连接
+                </button>
+                <button type="button" onclick="closeModal('ip-activity-modal')" class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-semibold py-2 px-4 rounded-lg text-sm shadow-md transition duration-200">关闭</button>
+            </div>
+        </div>
+    </div>
 
-    <!-- 模态框：通用确认 -->
-    <div id="confirm-modal" class="modal">
-        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-sm">
-            <h3 class="text-xl font-bold text-gray-800 mb-4 border-b pb-2" id="confirm-title"></h3>
-            <p id="confirm-message" class="text-gray-700 mb-6"></p>
-            <div class="flex justify-end space-x-3">
-                <button type="button" onclick="closeModal('confirm-modal')" class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-semibold py-2 px-4 rounded-lg">取消</button>
-                <button type="button" id="confirm-action-btn" class="bg-red-600 hover:bg-red-700 text-white font-semibold py-2 px-4 rounded-lg">确认</button>
-            </div>
-        </div>
-            <input type="hidden" id="confirm-param1">
-            <input type="hidden" id="confirm-param2">
-            <input type="hidden" id="confirm-param3">
-            <input type="hidden" id="confirm-type">
-    </div>
-    
-    <!-- 模态框：批量操作（待实现） -->
-    <div id="batch-modal" class="modal">
-        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-lg">
-            <h3 class="text-xl font-bold text-gray-800 mb-4 border-b pb-2">批量操作 / 续期</h3>
-            <p class="text-gray-500">此功能将在后续的后端开发中实现。</p>
-            <div class="mt-6 flex justify-end">
-                <button type="button" onclick="closeModal('batch-modal')" class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-semibold py-2 px-4 rounded-lg">关闭</button>
-            </div>
-        </div>
-    </div>
-    
+    <!-- 模态框：通用确认 -->
+    <div id="confirm-modal" class="fixed inset-0 bg-gray-900 bg-opacity-50 z-[1000] hidden justify-center items-center">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-sm transition duration-300 transform scale-100">
+            <h3 class="text-xl font-bold text-gray-800 mb-4 border-b pb-2" id="confirm-title"></h3>
+            <p id="confirm-message" class="text-gray-700 mb-6"></p>
+            <div class="flex justify-end space-x-3">
+                <button type="button" onclick="closeModal('confirm-modal')" class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-semibold py-2 px-4 rounded-lg shadow-md transition duration-200">取消</button>
+                <button type="button" id="confirm-action-btn" class="bg-red-600 hover:bg-red-700 text-white font-semibold py-2 px-4 rounded-lg shadow-md transition duration-200">确认</button>
+            </div>
+             <!-- 隐藏字段用于存储参数，保持原有JS逻辑兼容性 -->
+            <input type="hidden" id="confirm-param1">
+            <input type="hidden" id="confirm-param2">
+            <input type="hidden" id="confirm-param3">
+            <input type="hidden" id="confirm-type">
+        </div>
+    </div>
+    
+    <!-- 模态框：批量操作（待实现） -->
+    <div id="batch-modal" class="fixed inset-0 bg-gray-900 bg-opacity-50 z-[1000] hidden justify-center items-center">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-lg transition duration-300 transform scale-100">
+            <h3 class="text-xl font-bold text-gray-800 mb-4 border-b pb-2">批量操作 / 续期</h3>
+            <p class="text-gray-500">此功能将在后续的后端开发中实现。</p>
+            <div class="mt-6 flex justify-end">
+                <button type="button" onclick="closeModal('batch-modal')" class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-semibold py-2 px-4 rounded-lg shadow-md transition duration-200">关闭</button>
+            </div>
+        </div>
+    </div>
+    
 
-    <script>
-        // --- 全局配置 (由 Flask 填充) ---
-        const API_BASE = '/api';
-        let currentView = 'dashboard';
-        const FLASK_CONFIG = {
-            WSS_HTTP_PORT: "{{ WSS_HTTP_PORT }}",
-            WSS_TLS_PORT: "{{ WSS_TLS_PORT }}",
-            STUNNEL_PORT: "{{ STUNNEL_PORT }}",
-            UDPGW_PORT: "{{ UDPGW_PORT }}",
-            PANEL_PORT: "{{ PANEL_PORT }}",
-            SSH_INTERNAL_PORT: "{{ INTERNAL_FORWARD_PORT }}"
-        };
+    <script>
+        // --- 全局配置 (由 Flask 填充) ---
+        const API_BASE = '/api';
+        let currentView = 'dashboard';
+        const FLASK_CONFIG = {
+            WSS_HTTP_PORT: "{{ WSS_HTTP_PORT }}",
+            WSS_TLS_PORT: "{{ WSS_TLS_PORT }}",
+            STUNNEL_PORT: "{{ STUNNEL_PORT }}",
+            UDPGW_PORT: "{{ UDPGW_PORT }}",
+            PANEL_PORT: "{{ PANEL_PORT }}",
+            SSH_INTERNAL_PORT: "{{ INTERNAL_FORWARD_PORT }}"
+        };
 
-        // --- 辅助工具函数 ---
+        // --- 辅助工具函数 ---
 
-        function showStatus(message, isSuccess = true) {
-            const statusDiv = document.getElementById('status-message');
-            statusDiv.innerHTML = message;
-            statusDiv.className = isSuccess 
-                ? 'bg-green-100 text-green-800 border-green-400 p-4 mb-6 rounded-xl font-medium border-l-4' 
-                : 'bg-red-100 text-red-800 border-red-400 p-4 mb-6 rounded-xl font-medium border-l-4';
-            statusDiv.style.display = 'block';
-            setTimeout(() => { statusDiv.style.display = 'none'; }, 5000);
-        }
+        function showStatus(message, isSuccess = true) {
+            const statusDiv = document.getElementById('status-message');
+            statusDiv.innerHTML = message;
+            statusDiv.className = isSuccess 
+                ? 'bg-green-100 text-green-800 border-green-400 p-4 mb-6 rounded-xl font-medium border-l-4' 
+                : 'bg-red-100 text-red-800 border-red-400 p-4 mb-6 rounded-xl font-medium border-l-4';
+            statusDiv.style.display = 'block';
+            setTimeout(() => { statusDiv.style.display = 'none'; }, 5000);
+        }
 
-        function openModal(id) {
-            document.getElementById(id).style.display = 'flex';
-        }
+        function openModal(id) {
+            // 使用 flex 来显示，与 Tailwind CSS 的 modal 样式保持一致
+            document.getElementById(id).style.display = 'flex';
+        }
 
-        function closeModal(id) {
-            document.getElementById(id).style.display = 'none';
-        }
+        function closeModal(id) {
+            document.getElementById(id).style.display = 'none';
+        }
 
-        function logout() {
-            window.location.href = '/logout'; 
-        }
-        
-        function formatSpeed(kbps) {
-            if (kbps < 1024) return kbps.toFixed(1) + ' KB/s';
-            const mbps = kbps / 1024;
-            return mbps.toFixed(2) + ' MB/s';
-        }
+        function logout() {
+            // FIX: Use window.location.assign() for compatibility in sandboxed environments
+            window.location.assign('/logout'); 
+        }
+        
+        function formatSpeed(kbps) {
+            if (kbps < 1024) return kbps.toFixed(1) + ' KB/s';
+            const mbps = kbps / 1024;
+            return mbps.toFixed(2) + ' MB/s';
+        }
 
-        // --- 视图切换逻辑 ---
-        
-        function switchView(viewId) {
-            const views = ['dashboard', 'users', 'settings', 'security'];
-            views.forEach(id => {
-                const element = document.getElementById('view-' + id);
-                if (element) element.style.display = (id === viewId) ? 'block' : 'none';
-            });
-            currentView = viewId;
-            // 刷新当前视图的数据
-            refreshAllData();
-            
-            // 更新侧边栏选中状态
-            document.querySelectorAll('.sidebar a').forEach(a => {
-                a.classList.remove('bg-indigo-50', 'text-indigo-700');
-                if (a.getAttribute('href').substring(1) === viewId) {
-                    a.classList.add('bg-indigo-50', 'text-indigo-700');
-                } else {
-                    a.classList.add('text-gray-700');
-                }
-            });
-        }
-        
-        // --- 数据渲染函数 ---
-        
-        function renderSystemStatus(data) {
-            const grid = document.getElementById('system-status-grid');
-            grid.innerHTML = ''; 
+        // --- 视图切换逻辑 ---
+        
+        function switchView(viewId) {
+            const views = ['dashboard', 'users', 'settings', 'security'];
+            views.forEach(id => {
+                const element = document.getElementById('view-' + id);
+                if (element) element.style.display = (id === viewId) ? 'block' : 'none';
+                
+                // 更新侧边栏链接样式 (Desktop)
+                const navLink = document.getElementById('nav-' + id);
+                if (navLink) {
+                    navLink.classList.remove('bg-indigo-100', 'text-indigo-700');
+                    navLink.classList.add('text-gray-700', 'hover:bg-gray-100');
+                    if (id === viewId) {
+                        navLink.classList.add('bg-indigo-100', 'text-indigo-700');
+                        navLink.classList.remove('text-gray-700', 'hover:bg-gray-100');
+                    }
+                }
+            });
+            currentView = viewId;
+            
+            // 更新移动端下拉框选中状态 (Mobile)
+            const mobileSelect = document.getElementById('mobile-view-select');
+            if (mobileSelect) {
+                mobileSelect.value = viewId;
+            }
 
-            const items = [
-                { name: 'CPU 使用率', value: data.cpu_usage.toFixed(1) + '%', color: 'bg-blue-500', icon: '⚡' },
-                { name: '内存 (用/总)', value: data.memory_used_gb.toFixed(2) + '/' + data.memory_total_gb.toFixed(2) + 'GB', color: 'bg-indigo-500', icon: '🧠' },
-                { name: '磁盘使用率', value: data.disk_used_percent.toFixed(1) + '%', color: 'bg-purple-500', icon: '💾' },
-                ...Object.keys(data.services).map(key => {
-                    const status = data.services[key].status;
-                    return {
-                        name: data.services[key].name,
-                        value: data.services[key].label,
-                        color: status === 'running' ? 'bg-green-500' : (status === 'failed' ? 'bg-red-500' : 'bg-yellow-500'),
-                        dotClass: status === 'running' ? 'status-active' : (status === 'failed' ? 'status-expired' : 'status-paused'),
-                        icon: '📡'
-                    };
-                })
-            ];
+            // 刷新当前视图的数据
+            refreshAllData();
+        }
+        
+        // --- 数据渲染函数 ---
+        
+        function renderSystemStatus(data) {
+            const grid = document.getElementById('system-status-grid');
+            // 使用 array.map 和 innerHTML 保持与原逻辑一致，但最好是用 createElement 优化性能
+            grid.innerHTML = ''; 
 
-            items.forEach(item => {
-                const dot = item.dotClass ? '<span class="status-dot ' + item.dotClass + '"></span>' : '';
-                grid.innerHTML += 
-                    '<div class="bg-white p-4 rounded-xl shadow-md border-b-4 ' + item.color.replace('bg-', 'border-') + ' card">' +
-                        '<div class="flex items-center text-sm font-medium text-gray-500 mb-1">' +
-                            item.icon + ' <span class="ml-1">' + item.name + '</span>' +
-                        '</div>' +
-                        '<p class="text-xl font-bold text-gray-800 flex items-center">' +
-                            dot + ' ' + item.value +
-                        '</p>' +
-                    '</div>';
-            });
-            
-            // 渲染端口状态列表
-            renderPortStatusList(data.ports);
-            
-            // 渲染用户快速统计
-            renderUserQuickStats(data.user_stats);
-        }
-        
-        function renderPortStatusList(ports) {
-            const container = document.getElementById('port-status-data');
-            container.innerHTML = '';
-            
-            ports.forEach(p => {
-                const isListening = p.status === 'LISTEN';
-                const dotClass = isListening ? 'status-active' : 'status-expired';
-                const textClass = isListening ? 'text-green-600' : 'text-red-600';
-                
-                container.innerHTML += 
-                    '<div class="flex justify-between items-center text-gray-700 p-2 bg-white rounded-lg shadow-sm">' +
-                        '<span class="font-medium">' + p.name + ' (' + p.port + '/' + p.protocol + '):</span>' +
-                        '<span class="font-bold flex items-center ' + textClass + '">' +
-                            '<span class="status-dot ' + dotClass + '"></span> ' + p.status +
-                        '</span>' +
-                    '</div>';
-            });
-        }
-        
-        function renderUserQuickStats(stats) {
-            const container = document.getElementById('user-quick-stats');
-            container.innerHTML = 
-                '<div class="bg-white p-4 rounded-xl shadow-md border-l-4 border-indigo-500 card">' +
-                    '<p class="text-sm text-gray-500">用户总数</p>' +
-                    '<p class="text-2xl font-bold">' + stats.total + '</p>' +
-                '</div>' +
-                '<div class="bg-white p-4 rounded-xl shadow-md border-l-4 border-green-500 card">' +
-                    '<p class="text-sm text-gray-500">活跃用户</p>' +
-                    '<p class="text-2xl font-bold">' + stats.active + '</p>' +
-                '</div>' +
-                '<div class="bg-white p-4 rounded-xl shadow-md border-l-4 border-yellow-500 card">' +
-                    '<p class="text-sm text-gray-500">暂停/不可用</p>' +
-                    '<p class="text-2xl font-bold">' + (stats.paused + stats.expired) + '</p>' +
-                '</div>' +
-                '<div class="bg-white p-4 rounded-xl shadow-md border-l-4 border-purple-500 card">' +
-                    '<p class="text-sm text-gray-500">总用量</p>' +
-                    '<p class="text-2xl font-bold">' + stats.total_traffic_gb.toFixed(2) + ' GB</p>' +
-                '</div>';
-        }
+            const items = [
+                { name: 'CPU 使用率', value: data.cpu_usage.toFixed(1) + '%', color: 'border-blue-500', icon: '⚡' },
+                { name: '内存 (用/总)', value: data.memory_used_gb.toFixed(2) + '/' + data.memory_total_gb.toFixed(2) + 'GB', color: 'border-indigo-500', icon: '🧠' },
+                { name: '磁盘使用率', value: data.disk_used_percent.toFixed(1) + '%', color: 'border-purple-500', icon: '💾' },
+                ...Object.keys(data.services).map(key => {
+                    const status = data.services[key].status;
+                    let color, dotClass;
+                    if (status === 'running') {
+                        color = 'border-green-500';
+                        dotClass = 'status-active';
+                    } else if (status === 'failed') {
+                        color = 'border-red-500';
+                        dotClass = 'status-expired';
+                    } else {
+                         // paused or unknown
+                        color = 'border-yellow-500';
+                        dotClass = 'status-paused';
+                    }
 
+                    return {
+                        name: data.services[key].name,
+                        value: data.services[key].label,
+                        color: color,
+                        dotClass: dotClass,
+                        icon: '📡'
+                    };
+                })
+            ];
 
-        function renderUserList(users) {
-            const tbody = document.getElementById('user-list-tbody');
-            tbody.innerHTML = '';
-            
-            if (users.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" class="px-6 py-4 text-center text-gray-500">暂无用户账号</td></tr>';
-                return;
-            }
-
-            users.forEach(user => {
-                const isPaused = user.status !== 'active';
-                let statusColor = 'bg-green-100 text-green-700';
-                if (user.status === 'paused') { statusColor = 'bg-yellow-100 text-yellow-700'; }
-                if (user.status === 'expired' || user.status === 'exceeded') { statusColor = 'bg-red-100 text-red-700'; }
-
-                const statusText = user.status_text;
-                const toggleAction = isPaused ? 'enable' : 'pause';
-                const toggleText = isPaused ? '启用' : '暂停';
-                const toggleColor = isPaused ? 'bg-green-500 hover:bg-green-600' : 'bg-yellow-500 hover:bg-yellow-600';
-                
-                const quotaLimit = user.quota_gb > 0 ? user.quota_gb : '∞';
-                const usageText = user.usage_gb.toFixed(2) + ' / ' + quotaLimit + ' GB';
-                
-                tbody.innerHTML += 
-                    '<tr id="row-' + user.username + '" class="hover:bg-gray-50">' +
-                        '<td class="px-6 py-4 whitespace-nowrap text-sm font-mono text-gray-900">' + user.username + '</td>' +
-                        '<td class="px-6 py-4 whitespace-nowrap text-sm">' +
-                            '<span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full ' + statusColor + '">' +
-                                statusText +
-                            '</span>' +
-                        '</td>' +
-                        '<td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">' + (user.expiry_date || '永不') + '</td>' +
-                        '<td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-700">' + usageText + '</td>' +
-                        '<td class="px-6 py-4 whitespace-nowrap text-sm font-mono text-indigo-600">' + formatSpeed(user.realtime_speed) + '</td>' +
-                        '<td class="px-6 py-4 whitespace-nowrap text-sm font-medium space-x-2">' +
-                            '<button onclick="openIPActivityModal(\'' + user.username + '\')" ' +
-                                    'class="bg-blue-500 hover:bg-blue-600 text-white py-1 px-3 rounded-lg text-xs transition duration-150">IP 追踪</button>' +
-                            '<button onclick="openSettingsModal(\'' + user.username + '\', \'' + (user.expiry_date || '') + '\', ' + user.quota_gb + ', ' + user.rate_kbps + ')" ' +
-                                    'class="bg-indigo-500 hover:bg-indigo-600 text-white py-1 px-3 rounded-lg text-xs transition duration-150">设置</button>' +
-                            '<button onclick="confirmAction(\'' + user.username + '\', \'' + toggleAction + '\', null, \'toggleStatus\', \'' + toggleText + '用户\')" ' +
-                                    'class="' + toggleColor + ' text-white py-1 px-3 rounded-lg text-xs transition duration-150">' + toggleText + '</button>' +
-                            '<button onclick="confirmAction(\'' + user.username + '\', \'delete\', null, \'deleteUser\', \'删除用户\')" ' +
-                                    'class="bg-red-500 hover:bg-red-600 text-white py-1 px-3 rounded-lg text-xs transition duration-150">删除</button>' +
-                        '</td>' +
-                    '</tr>';
-            });
-        }
-        
-        function renderIPActivity(username, ipData) {
-            const listDiv = document.getElementById('active-ip-list');
-            listDiv.innerHTML = '';
-            
-            if (ipData.length === 0 || (ipData.length === 1 && ipData[0].ip === 'N/A (离线累计)')) {
-                const offlineTraffic = ipData.length === 1 ? ipData[0].usage_gb.toFixed(2) : '0.00';
-                listDiv.innerHTML = '<p class="text-gray-500 p-2">此用户目前没有活动的连接记录。' + 
-                    (offlineTraffic > 0 ? ' (累计离线流量: ' + offlineTraffic + ' GB)' : '') + '</p>';
-                return;
-            }
-
-            ipData.forEach(ipInfo => {
-                const isBanned = ipInfo.is_banned;
-                const action = isBanned ? 'unban' : 'ban';
-                const actionText = isBanned ? '解除封禁' : '封禁 IP';
-                const buttonColor = isBanned ? 'bg-green-600 hover:bg-green-700' : 'bg-red-600 hover:bg-red-700';
-                const banTag = isBanned ? '<span class="text-xs px-2 py-0.5 rounded-full ip-banned-tag ml-2">已封禁 (防火墙)</span>' : '';
-
-                listDiv.innerHTML += 
-                    '<div class="flex flex-col sm:flex-row items-start sm:items-center justify-between p-3 bg-white border border-gray-200 rounded-lg shadow-sm">' +
-                        '<div class="min-w-0 flex-1 flex flex-col sm:flex-row sm:items-center">' +
-                            '<p class="font-mono text-sm text-gray-900 flex items-center">' +
-                                '<strong>' + ipInfo.ip + '</strong> ' + banTag +
-                            '</p>' +
-                            '<p class="text-xs text-gray-500 mt-1 sm:mt-0 sm:ml-4">' +
-                                '流量: ' + ipInfo.usage_gb.toFixed(2) + ' GB | 速度: ' + formatSpeed(ipInfo.realtime_speed) + (ipInfo.pids.length > 0 ? ' | PIDs: ' + ipInfo.pids.join(', ') : '') +
-                            '</p>' +
-                        '</div>' +
-                        '<button onclick="confirmAction(\'' + username + '\', \'' + ipInfo.ip + '\', \'' + action + '\', \'userIpControl\', \'' + actionText + ' IP\')" ' +
-                                'class="mt-2 sm:mt-0 w-full sm:w-auto ' + buttonColor + ' text-white py-1.5 px-3 rounded-lg text-xs font-semibold transition duration-150">' +
-                            actionText +
-                        '</button>' +
-                    '</div>';
-            });
-        }
-        
-        async function renderAuditLogs(logs) {
-            const logContainer = document.getElementById('audit-log-content');
-            if (logs.length === 0 || logs[0] === '读取日志失败或日志文件为空。' || logs[0] === '日志文件不存在。') {
-                logContainer.innerHTML = '<p class="text-gray-500">' + logs[0] + '</p>';
-                return;
-            }
-            logContainer.innerHTML = logs.map(log => {
-                const parts = log.match(/^\[(.*?)\] \[USER:(.*?)\] \[IP:(.*?)\] ACTION:(.*?) DETAILS: (.*)$/);
-                if (parts) {
-                    const [_, timestamp, user, ip, action, details] = parts;
-                    return '<div class="text-xs text-gray-700 font-mono space-y-1 p-1 hover:bg-gray-200 rounded-md">' +
-                        '<span class="text-indigo-600">' + timestamp.split(' ')[1] + '</span> ' +
-                        '<span class="font-bold">[' + user + ']</span> ' +
-                        '<span class="text-sm font-semibold text-gray-900">' + action + '</span> ' +
-                        '<span class="text-gray-500">' + details + '</span>' +
-                    '</div>';
-                }
-                return '<div class="text-xs text-gray-700 font-mono p-1">' + log + '</div>';
-            }).join('');
-        }
-        
-        function renderGlobalBans(bans) {
-            const container = document.getElementById('global-ban-list');
-            if (Object.keys(bans).length === 0) {
-                 container.innerHTML = '<p class="text-green-600 font-semibold p-2">目前没有全局封禁的 IP。</p>';
-                 return;
-            }
-            container.innerHTML = Object.keys(bans).map(ip => {
-                const banInfo = bans[ip];
-                return (
-                    '<div class="flex justify-between items-center p-3 bg-red-50 border border-red-200 rounded-lg shadow-sm">' +
-                        '<div class="font-mono text-sm text-red-700">' +
-                            '<strong>' + ip + '</strong> ' +
-                            '<span class="text-xs text-gray-500 ml-4">原因: ' + (banInfo.reason || 'N/A') + ' (添加于 ' + banInfo.timestamp + ')</span>' +
-                        '</div>' +
-                        '<button onclick="confirmAction(null, \'' + ip + '\', null, \'unbanGlobal\', \'解除全局封禁\')" ' +
-                                'class="bg-green-600 hover:bg-green-700 text-white py-1.5 px-3 rounded-lg text-xs font-semibold">解除封禁</button>' +
-                    '</div>'
-                );
-            }).join('');
-        }
+            items.forEach(item => {
+                const dot = item.dotClass ? '<span class="status-dot ' + item.dotClass + '"></span>' : '';
+                grid.innerHTML += 
+                    '<div class="bg-white p-4 rounded-xl shadow-md border-b-4 ' + item.color + ' transition duration-300 ease-in-out hover:-translate-y-0.5 hover:shadow-xl">' +
+                        '<div class="flex items-center text-sm font-medium text-gray-500 mb-1">' +
+                            item.icon + ' <span class="ml-1">' + item.name + '</span>' +
+                        '</div>' +
+                        '<p class="text-xl font-bold text-gray-800 flex items-center">' +
+                            dot + ' ' + item.value +
+                        '</p>' +
+                    '</div>';
+            });
+            
+            // 渲染端口状态列表
+            renderPortStatusList(data.ports);
+            
+            // 渲染用户快速统计
+            renderUserQuickStats(data.user_stats);
+        }
+        
+        function renderPortStatusList(ports) {
+            const container = document.getElementById('port-status-data');
+            container.innerHTML = '';
+            
+            ports.forEach(p => {
+                const isListening = p.status === 'LISTEN';
+                const dotClass = isListening ? 'status-active' : 'status-expired';
+                const textClass = isListening ? 'text-green-600' : 'text-red-600';
+                
+                container.innerHTML += 
+                    '<div class="flex justify-between items-center text-gray-700 p-2 bg-white rounded-lg shadow-sm border border-gray-100">' +
+                        '<span class="font-medium">' + p.name + ' (' + p.port + '/' + p.protocol + '):</span>' +
+                        '<span class="font-bold flex items-center ' + textClass + '">' +
+                            '<span class="status-dot ' + dotClass + '"></span> ' + p.status +
+                        '</span>' +
+                    '</div>';
+            });
+        }
+        
+        function renderUserQuickStats(stats) {
+            const container = document.getElementById('user-quick-stats');
+            container.innerHTML = 
+                '<div class="bg-white p-4 rounded-xl shadow-md border-l-4 border-indigo-500 transition duration-300 ease-in-out hover:-translate-y-0.5 hover:shadow-xl">' +
+                    '<p class="text-sm text-gray-500">用户总数</p>' +
+                    '<p class="text-2xl font-bold">' + stats.total + '</p>' +
+                '</div>' +
+                '<div class="bg-white p-4 rounded-xl shadow-md border-l-4 border-green-500 transition duration-300 ease-in-out hover:-translate-y-0.5 hover:shadow-xl">' +
+                    '<p class="text-sm text-gray-500">活跃用户</p>' +
+                    '<p class="text-2xl font-bold">' + stats.active + '</p>' +
+                '</div>' +
+                '<div class="bg-white p-4 rounded-xl shadow-md border-l-4 border-yellow-500 transition duration-300 ease-in-out hover:-translate-y-0.5 hover:shadow-xl">' +
+                    '<p class="text-sm text-gray-500">暂停/不可用</p>' +
+                    '<p class="text-2xl font-bold">' + (stats.paused + stats.expired) + '</p>' +
+                '</div>' +
+                '<div class="bg-white p-4 rounded-xl shadow-md border-l-4 border-purple-500 transition duration-300 ease-in-out hover:-translate-y-0.5 hover:shadow-xl">' +
+                    '<p class="text-sm text-gray-500">总用量</p>' +
+                    '<p class="text-2xl font-bold">' + stats.total_traffic_gb.toFixed(2) + ' GB</p>' +
+                '</div>';
+        }
 
 
-        // --- 核心 API 调用函数 ---
-        
-        async function fetchData(url, options = {}) {
-            try {
-                const response = await fetch(API_BASE + url, options);
-                const data = await response.json();
-                
-                if (!response.ok || !data.success) {
-                    showStatus(data.message || 'API Error: ' + url, false);
-                    return null;
-                }
-                return data;
-            } catch (error) {
-                showStatus('网络请求失败: ' + error.message, false);
-                return null;
-            }
-        }
+        function renderUserList(users) {
+            const tbody = document.getElementById('user-list-tbody');
+            tbody.innerHTML = '';
+            
+            if (users.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="px-6 py-4 text-center text-gray-500">暂无用户账号</td></tr>';
+                return;
+            }
 
-        async function fetchServiceLogs(serviceId) {
-            const logContainer = document.getElementById('service-log-content');
-            logContainer.textContent = '正在加载 ' + serviceId + ' 日志...';
-            
-            const data = await fetchData('/system/logs', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ service: serviceId })
-            });
+            users.forEach(user => {
+                const isPaused = user.status !== 'active';
+                let statusColor = 'bg-green-100 text-green-700';
+                if (user.status === 'paused') { statusColor = 'bg-yellow-100 text-yellow-700'; }
+                if (user.status === 'expired' || user.status === 'exceeded') { statusColor = 'bg-red-100 text-red-700'; }
 
-            if (data && data.logs) {
-                logContainer.textContent = data.logs;
-            } else {
-                logContainer.textContent = '无法加载 ' + serviceId + ' 日志。';
-            }
-        }
-        
-        // --- 实时刷新主函数 ---
+                const statusText = user.status_text;
+                const toggleAction = isPaused ? 'enable' : 'pause';
+                const toggleText = isPaused ? '启用' : '暂停';
+                const toggleColor = isPaused ? 'bg-green-500 hover:bg-green-600' : 'bg-yellow-500 hover:bg-yellow-600';
+                
+                // 修复了 usageText 的逻辑，使其与后端返回的用户数据匹配
+                const quotaLimit = user.quota_gb > 0 ? user.quota_gb : '∞';
+                const usageText = user.usage_gb.toFixed(2) + ' / ' + quotaLimit + ' GB';
+                
+                // 针对移动端优化操作按钮布局：使用 flex-wrap 和 gap-1 确保按钮换行并显示完全
+                tbody.innerHTML += 
+                    '<tr id="row-' + user.username + '" class="hover:bg-gray-50 transition duration-100">' +
+                        '<td class="px-6 py-4 whitespace-nowrap text-sm font-mono text-gray-900">' + user.username + '</td>' +
+                        '<td class="px-6 py-4 whitespace-nowrap text-sm">' +
+                            '<span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full ' + statusColor + '">' +
+                                statusText +
+                            '</span>' +
+                        '</td>' +
+                        '<td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">' + (user.expiry_date || '永不') + '</td>' +
+                        '<td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-700">' + usageText + '</td>' +
+                        '<td class="px-6 py-4 whitespace-nowrap text-sm font-mono text-indigo-600">' + formatSpeed(user.realtime_speed) + '</td>' +
+                        '<td class="px-6 py-4 text-sm font-medium">' +
+                            '<div class="flex flex-wrap gap-1">' + // 按钮换行容器
+                                '<button onclick="openIPActivityModal(\'' + user.username + '\')" ' +
+                                        'class="bg-blue-500 hover:bg-blue-600 text-white py-1.5 px-2 rounded-lg text-xs transition duration-150 shadow-sm">IP 追踪</button>' +
+                                '<button onclick="openSettingsModal(\'' + user.username + '\', \'' + (user.expiry_date || '') + '\', ' + user.quota_gb + ', ' + user.rate_kbps + ')" ' +
+                                        'class="bg-indigo-500 hover:bg-indigo-600 text-white py-1.5 px-2 rounded-lg text-xs transition duration-150 shadow-sm">设置</button>' +
+                                '<button onclick="confirmAction(\'' + user.username + '\', \'' + toggleAction + '\', null, \'toggleStatus\', \'' + toggleText + '用户\')" ' + 
+                                        'class="' + toggleColor + ' text-white py-1.5 px-2 rounded-lg text-xs transition duration-150 shadow-sm">' + toggleText + '</button>' +
+                                '<button onclick="confirmAction(\'' + user.username + '\', \'delete\', null, \'deleteUser\', \'删除用户\')" ' +
+                                        'class="bg-red-500 hover:bg-red-600 text-white py-1.5 px-2 rounded-lg text-xs transition duration-150 shadow-sm">删除</button>' +
+                            '</div>' +
+                        '</td>' +
+                    '</tr>';
+            });
+        }
+        
+        function renderIPActivity(username, ipData) {
+            const listDiv = document.getElementById('active-ip-list');
+            listDiv.innerHTML = '';
+            
+            if (ipData.length === 0 || (ipData.length === 1 && ipData[0].ip === 'N/A (离线累计)')) {
+                const offlineTraffic = ipData.length === 1 ? ipData[0].usage_gb.toFixed(2) : '0.00';
+                listDiv.innerHTML = '<p class="text-gray-500 p-2">此用户目前没有活动的连接记录。' + 
+                    (offlineTraffic > 0 ? ' (累计离线流量: ' + offlineTraffic + ' GB)' : '') + '</p>';
+                return;
+            }
 
-        async function refreshAllData() {
-            // 1. 获取系统和组件状态
-            const statusData = await fetchData('/system/status');
-            if (statusData) {
-                renderSystemStatus(statusData);
-            }
+            ipData.forEach(ipInfo => {
+                const isBanned = ipInfo.is_banned;
+                const action = isBanned ? 'unban' : 'ban';
+                const actionText = isBanned ? '解除封禁' : '封禁 IP';
+                const buttonColor = isBanned ? 'bg-green-600 hover:bg-green-700' : 'bg-red-600 hover:bg-red-700';
+                const banTag = isBanned ? '<span class="text-xs px-2 py-0.5 rounded-full ip-banned-tag ml-2">已封禁 (防火墙)</span>' : '';
 
-            if (currentView === 'users' || currentView === 'dashboard') {
-                // 2. 获取用户列表和统计
-                const usersData = await fetchData('/users/list');
-                if (usersData) {
-                    renderUserList(usersData.users);
-                }
-            }
-            
-            if (currentView === 'settings') {
-                // 3. 获取审计日志
-                const auditData = await fetchData('/system/audit_logs');
-                if (auditData) {
-                    renderAuditLogs(auditData.logs);
-                }
-            }
-            
-            if (currentView === 'security') {
-                // 4. 获取全局 IP 封禁列表
-                const globalData = await fetchData('/ips/global_list');
-                if (globalData) {
-                    renderGlobalBans(globalData.global_bans);
-                }
-            }
-            
-            // 5. (静默刷新：IP 活跃度模态框如果打开则刷新)
-            const ipModal = document.getElementById('ip-activity-modal');
-            if (ipModal.style.display === 'flex') {
-                const username = document.getElementById('ip-modal-username-title').textContent;
-                fetchIPActivity(username); 
-            }
-        }
-
-        // --- 用户操作实现 ---
-
-        document.getElementById('add-user-form').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            
-            const username = document.getElementById('new-username').value;
-            const password = document.getElementById('new-password').value;
-            const expirationDays = document.getElementById('expiration-days').value;
-
-            if (!/^[a-z0-9_]{3,16}$/.test(username)) {
-                showStatus('用户名格式不正确 (3-16位小写字母/数字/下划线)', false);
-                return;
-            }
-            
-            showStatus('正在创建用户 ' + username + '...', true);
-
-            const result = await fetchData('/users/add', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ username: username, password: password, expiration_days: parseInt(expirationDays) })
-            });
-
-            if (result) {
-                showStatus(result.message, true);
-                document.getElementById('add-user-form').reset();
-                refreshAllData(); 
-            }
-        });
-        
-        function openSettingsModal(username, expiry_date, quota_gb, rate_kbps) {
-            document.getElementById('modal-username-title').textContent = username;
-            document.getElementById('modal-username-setting').value = username;
-            
-            document.getElementById('modal-expiry-date').value = expiry_date; 
-            document.getElementById('modal-quota-gb').value = quota_gb;
-            document.getElementById('modal-rate-kbps').value = rate_kbps;
-            document.getElementById('modal-new-password').value = '';
-            
-            openModal('settings-modal');
-        }
-
-        async function saveUserSettings() {
-            const username = document.getElementById('modal-username-setting').value;
-            const expiry_date = document.getElementById('modal-expiry-date').value;
-            const quota_gb = document.getElementById('modal-quota-gb').value;
-            const rate_kbps = document.getElementById('modal-rate-kbps').value;
-            const new_password = document.getElementById('modal-new-password').value;
-            
-            closeModal('settings-modal');
-            showStatus('正在保存用户 ' + username + ' 的设置...', true);
-
-            const result = await fetchData('/users/set_settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ 
-                    username: username, 
-                    expiry_date: expiry_date, 
-                    quota_gb: parseFloat(quota_gb), 
-                    rate_kbps: parseInt(rate_kbps),
-                    new_ssh_password: new_password
-                })
-            });
-
-            if (result) {
-                showStatus(result.message, true);
-                refreshAllData();
-            }
-        }
-        
-        function openIPActivityModal(username) {
-            document.getElementById('ip-modal-username-title').textContent = username;
-            openModal('ip-activity-modal');
-            fetchIPActivity(username);
-        }
-        
-        async function fetchIPActivity(username) {
-            const listDiv = document.getElementById('active-ip-list');
-            listDiv.innerHTML = '<p class="text-indigo-500 p-2">正在从系统进程中获取实时 IP 数据...</p>';
-            
-            const data = await fetchData('/users/ip_activity?username=' + username);
-            
-            if (data) {
-                renderIPActivity(username, data.ip_data);
-            }
-        }
-
-        // --- 通用确认及执行逻辑 ---
-
-        // 重构后的 confirmAction 函数：使用隐藏字段存储参数
-        function confirmAction(param1, param2, param3, type, titleText) {
-            let message = '';
-            
-            document.getElementById('confirm-param1').value = param1 || ''; // username 或 service
-            document.getElementById('confirm-param2').value = param2 || ''; // action (enable/pause/delete/restart) 或 IP
-            document.getElementById('confirm-param3').value = param3 || ''; // (额外参数，如 IP 的 ban/unban 动作)
-            document.getElementById('confirm-type').value = type;
-            
-            const username = param1;
-            const action = param2;
-            const ipAction = param3; // 实际的封禁动作 (ban/unban)
-            
-            if (type === 'deleteUser') {
-                message = '您确定要永久删除用户 <strong>' + username + '</strong> 吗？此操作不可逆，将删除系统账户和所有配置。';
-            } else if (type === 'toggleStatus') {
-                message = '您确定要 ' + (action === 'pause' ? '暂停' : '启用') + ' 用户 <strong>' + username + '</strong> 吗？';
-            } else if (type === 'userIpControl') {
-                // param1=username, param2=ip, param3=action (ban/unban)
-                message = '您确定要对用户 <strong>' + username + '</strong> 的 IP 地址 <strong>' + action + '</strong> 执行 ' + (ipAction === 'ban' ? '封禁' : '解除封禁') + ' 操作吗？此操作将立即通过防火墙规则生效。';
-                // 确保参数在 executeAction 中能够正确映射
-                document.getElementById('confirm-param2').value = action; // IP
-                document.getElementById('confirm-param3').value = ipAction; // action: ban/unban
-            } else if (type === 'killAll') {
-                message = '警告：您确定要强制断开用户 <strong>' + username + '</strong> 的所有活跃连接吗？这会强制用户重新连接。';
-            } else if (type === 'serviceControl') {
-                message = '警告：您确定要重启核心服务 <strong>' + username + '</strong> 吗？这可能会导致短暂的服务中断。';
-            } else if (type === 'unbanGlobal') {
-                message = '您确定要解除全局封禁 IP 地址 <strong>' + action + '</strong> 吗？';
-                document.getElementById('confirm-param2').value = action; // IP
-            } else if (type === 'banGlobal') {
-                message = '您确定要对 IP 地址 <strong>' + action + '</strong> 执行全局封禁操作吗？';
-                document.getElementById('confirm-param2').value = action; // IP
-            } else if (type === 'resetTraffic') {
-                message = '警告：您确定要将用户 <strong>' + username + '</strong> 的流量使用量计数器重置为 0 吗？';
-            }
-
-            document.getElementById('confirm-title').textContent = titleText;
-            document.getElementById('confirm-message').innerHTML = message;
-            
-            const confirmBtn = document.getElementById('confirm-action-btn');
-            
-            if (type.includes('ban') || type === 'killAll' || type === 'serviceControl' || type === 'deleteUser') {
-                 confirmBtn.className = 'bg-red-600 hover:bg-red-700 text-white font-semibold py-2 px-4 rounded-lg';
-            } else if (type.includes('enable') || type === 'unbanGlobal' || type === 'resetTraffic') {
-                 confirmBtn.className = 'bg-green-600 hover:bg-green-700 text-white font-semibold py-2 px-4 rounded-lg';
-            } else {
-                 confirmBtn.className = 'bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2 px-4 rounded-lg';
-            }
-
-            confirmBtn.onclick = executeAction;
-            
-            openModal('confirm-modal');
-        }
-
-        async function executeAction() {
-            closeModal('confirm-modal');
-            
-            const username = document.getElementById('confirm-param1').value;
-            const param2 = document.getElementById('confirm-param2').value;
-            const param3 = document.getElementById('confirm-param3').value;
-            const type = document.getElementById('confirm-type').value;
-
-            showStatus('正在执行 ' + type + ' 操作...', true);
-
-            let url;
-            let body = {};
-
-            if (type === 'deleteUser') {
-                url = '/users/delete';
-                body = { username: username };
-            } else if (type === 'toggleStatus') {
-                url = '/users/status';
-                body = { username: username, action: param2 }; // param2 is action (enable/pause)
-            } else if (type === 'killAll') {
-                url = '/users/kill_all';
-                body = { username: username };
-            } else if (type === 'resetTraffic') {
-                url = '/users/reset_traffic';
-                body = { username: username };
-            } else if (type === 'userIpControl') {
-                // param2: IP, param3: ban/unban
-                url = '/ips/' + param3; 
-                body = { ip: param2, username: username };
-            } else if (type === 'serviceControl') {
-                // param1: service, param2: action
-                url = '/system/control';
-                body = { service: username, action: param2 };
-            } else if (type === 'unbanGlobal') {
-                // param2: IP
-                url = '/ips/unban_global';
-                body = { ip: param2 };
-            } else if (type === 'banGlobal') {
-                // param2: IP
-                url = '/ips/ban_global';
-                body = { ip: param2, reason: 'Manual Global Ban' };
-            }
-
-            const result = await fetchData(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
-            });
-
-            if (result) {
-                showStatus(result.message, true);
-                if (type === 'userIpControl' || type === 'killAll') {
-                    // 刷新 IP 模态框
-                    fetchIPActivity(username); 
-                }
-                
-                // 系统控制或主用户列表的刷新 (延迟刷新以等待系统命令生效)
-                if (type === 'serviceControl' || type === 'deleteUser' || type === 'toggleStatus' || type === 'unbanGlobal' || type === 'banGlobal' || type === 'resetTraffic' || type === 'userIpControl') {
-                    setTimeout(refreshAllData, 2000); 
-                }
-            }
-        }
-        
-        document.getElementById('add-global-ban-form').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const ip = document.getElementById('global-ban-ip').value;
-            
-            if (!ip) return showStatus('IP 地址不能为空', false);
-            
-            confirmAction(null, ip, null, 'banGlobal', '全局封禁 IP');
-        });
+                listDiv.innerHTML += 
+                    '<div class="flex flex-col sm:flex-row items-start sm:items-center justify-between p-3 bg-white border border-gray-200 rounded-lg shadow-sm">' +
+                        '<div class="min-w-0 flex-1 flex flex-col sm:flex-row sm:items-center">' +
+                            '<p class="font-mono text-sm text-gray-900 flex items-center">' +
+                                '<strong>' + ipInfo.ip + '</strong> ' + banTag +
+                            '</p>' +
+                            '<p class="text-xs text-gray-500 mt-1 sm:mt-0 sm:ml-4">' +
+                                '流量: ' + ipInfo.usage_gb.toFixed(2) + ' GB | 速度: ' + formatSpeed(ipInfo.realtime_speed) + (ipInfo.pids.length > 0 ? ' | PIDs: ' + ipInfo.pids.join(', ') : '') +
+                            '</p>' +
+                        '</div>' +
+                        // 按钮在移动端使用 w-full 占满宽度，在 SM 以上自适应 (w-auto)
+                        '<button onclick="confirmAction(\'' + username + '\', \'' + ipInfo.ip + '\', \'' + action + '\', \'userIpControl\', \'' + actionText + ' IP\')" ' +
+                                'class="mt-2 sm:mt-0 w-full sm:w-auto ' + buttonColor + ' text-white py-1.5 px-3 rounded-lg text-xs font-semibold transition duration-150 shadow-sm">' +
+                            actionText +
+                        '</button>' +
+                    '</div>';
+            });
+        }
+        
+        async function renderAuditLogs(logs) {
+            const logContainer = document.getElementById('audit-log-content');
+            if (logs.length === 0 || logs[0] === '读取日志失败或日志文件为空。' || logs[0] === '日志文件不存在。') {
+                logContainer.innerHTML = '<p class="text-gray-500">' + logs[0] + '</p>';
+                return;
+            }
+            logContainer.innerHTML = logs.map(log => {
+                const parts = log.match(/^\[(.*?)\] \[USER:(.*?)\] \[IP:(.*?)\] ACTION:(.*?) DETAILS: (.*)$/);
+                if (parts) {
+                    const [_, timestamp, user, ip, action, details] = parts;
+                    return '<div class="text-xs text-gray-700 font-mono space-y-1 p-1 hover:bg-gray-200 rounded-md">' +
+                        '<span class="text-indigo-600">' + timestamp.split(' ')[1] + '</span> ' +
+                        '<span class="font-bold">[' + user + ']</span> ' +
+                        '<span class="text-sm font-semibold text-gray-900">' + action + '</span> ' +
+                        '<span class="text-gray-500">' + details + '</span>' +
+                    '</div>';
+                }
+                return '<div class="text-xs text-gray-700 font-mono p-1">' + log + '</div>';
+            }).join('');
+        }
+        
+        function renderGlobalBans(bans) {
+            const container = document.getElementById('global-ban-list');
+            if (Object.keys(bans).length === 0) {
+                 container.innerHTML = '<p class="text-green-600 font-semibold p-2">目前没有全局封禁的 IP。</p>';
+                 return;
+            }
+            container.innerHTML = Object.keys(bans).map(ip => {
+                const banInfo = bans[ip];
+                return (
+                    '<div class="flex justify-between items-center p-3 bg-red-50 border border-red-200 rounded-lg shadow-sm">' +
+                        '<div class="font-mono text-sm text-red-700">' +
+                            '<strong>' + ip + '</strong> ' +
+                            '<span class="text-xs text-gray-500 ml-4">原因: ' + (banInfo.reason || 'N/A') + ' (添加于 ' + banInfo.timestamp + ')</span>' +
+                        '</div>' +
+                        // 按钮自适应宽度
+                        '<button onclick="confirmAction(null, \'' + ip + '\', null, \'unbanGlobal\', \'解除全局封禁\')" ' +
+                                'class="bg-green-600 hover:bg-green-700 text-white py-1.5 px-3 rounded-lg text-xs font-semibold flex-shrink-0">解除封禁</button>' +
+                    '</div>'
+                );
+            }).join('');
+        }
 
 
-        // --- 启动脚本 ---
-        
-        window.onload = function() {
-            // 初始加载和定时刷新
-            switchView('dashboard');
-            setInterval(refreshAllData, 10000); 
-        };
+        // --- 核心 API 调用函数 ---
+        
+        async function fetchData(url, options = {}) {
+            try {
+                const response = await fetch(API_BASE + url, options);
+                const data = await response.json();
+                
+                if (!response.ok || !data.success) {
+                    showStatus(data.message || 'API Error: ' + url, false);
+                    return null;
+                }
+                return data;
+            } catch (error) {
+                showStatus('网络请求失败: ' + error.message, false);
+                return null;
+            }
+        }
 
-    </script>
+        async function fetchServiceLogs(serviceId) {
+            const logContainer = document.getElementById('service-log-content');
+            logContainer.textContent = '正在加载 ' + serviceId + ' 日志...';
+            
+            const data = await fetchData('/system/logs', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ service: serviceId })
+            });
+
+            if (data && data.logs) {
+                logContainer.textContent = data.logs;
+            } else {
+                logContainer.textContent = '无法加载 ' + serviceId + ' 日志。';
+            }
+        }
+        
+        // --- 实时刷新主函数 ---
+
+        async function refreshAllData() {
+            // 1. 获取系统和组件状态
+            const statusData = await fetchData('/system/status');
+            if (statusData) {
+                renderSystemStatus(statusData);
+            }
+
+            if (currentView === 'users' || currentView === 'dashboard') {
+                // 2. 获取用户列表和统计
+                const usersData = await fetchData('/users/list');
+                if (usersData) {
+                    renderUserList(usersData.users);
+                }
+            }
+            
+            if (currentView === 'settings') {
+                // 3. 获取审计日志
+                const auditData = await fetchData('/system/audit_logs');
+                if (auditData) {
+                    renderAuditLogs(auditData.logs);
+                }
+            }
+            
+            if (currentView === 'security') {
+                // 4. 获取全局 IP 封禁列表
+                const globalData = await fetchData('/ips/global_list');
+                if (globalData) {
+                    renderGlobalBans(globalData.global_bans);
+                }
+            }
+            
+            // 5. (静默刷新：IP 活跃度模态框如果打开则刷新)
+            const ipModal = document.getElementById('ip-activity-modal');
+            if (ipModal.style.display === 'flex') {
+                const username = document.getElementById('ip-modal-username-title').textContent;
+                fetchIPActivity(username); 
+            }
+        }
+
+        // --- 用户操作实现 ---
+
+        document.getElementById('add-user-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const username = document.getElementById('new-username').value;
+            const password = document.getElementById('new-password').value;
+            const expirationDays = document.getElementById('expiration-days').value;
+
+            if (!/^[a-z0-9_]{3,16}$/.test(username)) {
+                showStatus('用户名格式不正确 (3-16位小写字母/数字/下划线)', false);
+                return;
+            }
+            
+            showStatus('正在创建用户 ' + username + '...', true);
+
+            const result = await fetchData('/users/add', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username: username, password: password, expiration_days: parseInt(expirationDays) })
+            });
+
+            if (result) {
+                showStatus(result.message, true);
+                document.getElementById('add-user-form').reset();
+                refreshAllData(); 
+            }
+        });
+        
+        function openSettingsModal(username, expiry_date, quota_gb, rate_kbps) {
+            document.getElementById('modal-username-title').textContent = username;
+            document.getElementById('modal-username-setting').value = username;
+            
+            document.getElementById('modal-expiry-date').value = expiry_date; 
+            document.getElementById('modal-quota-gb').value = quota_gb;
+            document.getElementById('modal-rate-kbps').value = rate_kbps;
+            document.getElementById('modal-new-password').value = '';
+            
+            openModal('settings-modal');
+        }
+
+        async function saveUserSettings() {
+            const username = document.getElementById('modal-username-setting').value;
+            const expiry_date = document.getElementById('modal-expiry-date').value;
+            const quota_gb = document.getElementById('modal-quota-gb').value;
+            const rate_kbps = document.getElementById('modal-rate-kbps').value;
+            const new_password = document.getElementById('modal-new-password').value;
+            
+            closeModal('settings-modal');
+            showStatus('正在保存用户 ' + username + ' 的设置...', true);
+
+            const result = await fetchData('/users/set_settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ 
+                    username: username, 
+                    expiry_date: expiry_date, 
+                    quota_gb: parseFloat(quota_gb), 
+                    rate_kbps: parseInt(rate_kbps),
+                    new_ssh_password: new_password
+                })
+            });
+
+            if (result) {
+                showStatus(result.message, true);
+                refreshAllData();
+            }
+        }
+        
+        function openIPActivityModal(username) {
+            document.getElementById('ip-modal-username-title').textContent = username;
+            openModal('ip-activity-modal');
+            fetchIPActivity(username);
+        }
+        
+        async function fetchIPActivity(username) {
+            const listDiv = document.getElementById('active-ip-list');
+            listDiv.innerHTML = '<p class="text-indigo-500 p-2">正在从系统进程中获取实时 IP 数据...</p>';
+            
+            const data = await fetchData('/users/ip_activity?username=' + username);
+            
+            if (data) {
+                renderIPActivity(username, data.ip_data);
+            }
+        }
+
+        // --- 通用确认及执行逻辑 ---
+
+        // 重构后的 confirmAction 函数：使用隐藏字段存储参数
+        function confirmAction(param1, param2, param3, type, titleText) {
+            let message = '';
+            
+            // 修复：使用隐藏字段存储参数，以兼容 executeAction 的实现
+            document.getElementById('confirm-param1').value = param1 || ''; // username 或 service
+            document.getElementById('confirm-param2').value = param2 || ''; // action (enable/pause/delete/restart) 或 IP
+            document.getElementById('confirm-param3').value = param3 || ''; // (额外参数，如 IP 的 ban/unban 动作)
+            document.getElementById('confirm-type').value = type;
+            
+            const username = param1;
+            const action = param2;
+            const ipAction = param3; // 实际的封禁动作 (ban/unban)
+            
+            if (type === 'deleteUser') {
+                message = '您确定要永久删除用户 <strong>' + username + '</strong> 吗？此操作不可逆，将删除系统账户和所有配置。';
+            } else if (type === 'toggleStatus') {
+                message = '您确定要 ' + (action === 'pause' ? '暂停' : '启用') + ' 用户 <strong>' + username + '</strong> 吗？';
+            } else if (type === 'userIpControl') {
+                // param1=username, param2=ip, param3=action (ban/unban)
+                message = '您确定要对用户 <strong>' + username + '</strong> 的 IP 地址 <strong>' + action + '</strong> 执行 ' + (ipAction === 'ban' ? '封禁' : '解除封禁') + ' 操作吗？此操作将立即通过防火墙规则生效。';
+                // 确保参数在 executeAction 中能够正确映射
+                document.getElementById('confirm-param2').value = action; // IP
+                document.getElementById('confirm-param3').value = ipAction; // action: ban/unban
+            } else if (type === 'killAll') {
+                message = '警告：您确定要强制断开用户 <strong>' + username + '</strong> 的所有活跃连接吗？这会强制用户重新连接。';
+            } else if (type === 'serviceControl') {
+                message = '警告：您确定要重启核心服务 <strong>' + username + '</strong> 吗？这可能会导致短暂的服务中断。';
+            } else if (type === 'unbanGlobal') {
+                message = '您确定要解除全局封禁 IP 地址 <strong>' + action + '</strong> 吗？';
+                document.getElementById('confirm-param2').value = action; // IP
+            } else if (type === 'banGlobal') {
+                message = '您确定要对 IP 地址 <strong>' + action + '</strong> 执行全局封禁操作吗？';
+                document.getElementById('confirm-param2').value = action; // IP
+            } else if (type === 'resetTraffic') {
+                message = '警告：您确定要将用户 <strong>' + username + '</strong> 的流量使用量计数器重置为 0 吗？';
+            }
+
+            document.getElementById('confirm-title').textContent = titleText;
+            document.getElementById('confirm-message').innerHTML = message;
+            
+            const confirmBtn = document.getElementById('confirm-action-btn');
+            
+            if (type.includes('ban') || type === 'killAll' || type === 'serviceControl' || type === 'deleteUser') {
+                 confirmBtn.className = 'bg-red-600 hover:bg-red-700 text-white font-semibold py-2 px-4 rounded-lg shadow-md transition duration-200';
+            } else if (type.includes('enable') || type === 'unbanGlobal' || type === 'resetTraffic') {
+                 confirmBtn.className = 'bg-green-600 hover:bg-green-700 text-white font-semibold py-2 px-4 rounded-lg shadow-md transition duration-200';
+            } else {
+                 confirmBtn.className = 'bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2 px-4 rounded-lg shadow-md transition duration-200';
+            }
+
+            confirmBtn.onclick = executeAction;
+            
+            openModal('confirm-modal');
+        }
+
+        async function executeAction() {
+            closeModal('confirm-modal');
+            
+            // 从隐藏字段读取参数
+            const username = document.getElementById('confirm-param1').value;
+            const param2 = document.getElementById('confirm-param2').value;
+            const param3 = document.getElementById('confirm-param3').value;
+            const type = document.getElementById('confirm-type').value;
+
+            showStatus('正在执行 ' + type + ' 操作...', true);
+
+            let url;
+            let body = {};
+
+            if (type === 'deleteUser') {
+                url = '/users/delete';
+                body = { username: username };
+            } else if (type === 'toggleStatus') {
+                url = '/users/status';
+                body = { username: username, action: param2 }; // param2 is action (enable/pause)
+            } else if (type === 'killAll') {
+                url = '/users/kill_all';
+                body = { username: username };
+            } else if (type === 'resetTraffic') {
+                url = '/users/reset_traffic';
+                body = { username: username };
+            } else if (type === 'userIpControl') {
+                // param2: IP, param3: ban/unban
+                url = '/ips/' + param3; 
+                body = { ip: param2, username: username };
+            } else if (type === 'serviceControl') {
+                // param1: service, param2: action
+                url = '/system/control';
+                body = { service: username, action: param2 };
+            } else if (type === 'unbanGlobal') {
+                // param2: IP
+                url = '/ips/unban_global';
+                body = { ip: param2 };
+            } else if (type === 'banGlobal') {
+                // param2: IP
+                url = '/ips/ban_global';
+                body = { ip: param2, reason: 'Manual Global Ban' };
+            }
+
+            const result = await fetchData(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+
+            if (result) {
+                showStatus(result.message, true);
+                if (type === 'userIpControl' || type === 'killAll') {
+                    // 刷新 IP 模态框
+                    fetchIPActivity(username); 
+                }
+                
+                // 系统控制或主用户列表的刷新 (延迟刷新以等待系统命令生效)
+                if (type === 'serviceControl' || type === 'deleteUser' || type === 'toggleStatus' || type === 'unbanGlobal' || type === 'banGlobal' || type === 'resetTraffic' || type === 'userIpControl') {
+                    setTimeout(refreshAllData, 2000); 
+                }
+            }
+        }
+        
+        document.getElementById('add-global-ban-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const ip = document.getElementById('global-ban-ip').value;
+            
+            if (!ip) return showStatus('IP 地址不能为空', false);
+            
+            // param1=null, param2=ip, param3=null, type='banGlobal', title='全局封禁 IP'
+            confirmAction(null, ip, null, 'banGlobal', '全局封禁 IP');
+        });
+
+
+        // --- 启动脚本 ---
+        
+        window.onload = function() {
+            // 初始加载和定时刷新
+            // 确保默认选中状态正确应用
+            const defaultNav = document.getElementById('nav-dashboard');
+            if (defaultNav) {
+                defaultNav.classList.add('bg-indigo-100', 'text-indigo-700');
+                defaultNav.classList.remove('text-gray-700', 'hover:bg-gray-100');
+            }
+
+            // 确保移动端下拉框选中正确的初始值
+            const mobileSelect = document.getElementById('mobile-view-select');
+            if (mobileSelect) {
+                mobileSelect.value = 'dashboard';
+            }
+
+            switchView('dashboard');
+            setInterval(refreshAllData, 10000); 
+        };
+
+    </script>
 </body>
 </html>
 EOF_HTML
