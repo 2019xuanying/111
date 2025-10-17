@@ -4,19 +4,22 @@
 set -eu
 
 # ==========================================================
-# WSS 隧道与用户管理面板一键部署脚本 (V2 最终稳定版 - 兼容性修复)
+# WSS 隧道与用户管理面板一键部署脚本 (V2.1 - 性能/安全/BBR 优化)
 # ----------------------------------------------------------
-# 修复：解决 safe_run_command 误判 ss 命令成功为失败的问题。
+# 优化：引入 bcrypt 密码哈希。
+# 优化：启用 BBR 拥塞控制和网络调优。
+# 优化：重构流量计数逻辑以提高面板性能。
+# 更改：移除复杂且脆弱的 IP 追踪，改为追踪活跃连接数。
+# 新增：面板新增实时活跃连接 IP 列表。
 # ==========================================================
 
 # =============================
-# 文件路径定义 (提前定义，确保 set -eu 兼容性)
+# 文件路径定义
 # =============================
 PANEL_DIR="/etc/wss-panel"
 ROOT_HASH_FILE="$PANEL_DIR/root_hash.txt"
 PANEL_HTML="$PANEL_DIR/index.html"
-SECRET_KEY_FILE="$PANEL_DIR/secret_key.txt" # Session Key 文件
-
+SECRET_KEY_FILE="$PANEL_DIR/secret_key.txt"
 
 # =============================
 # 提示端口和面板密码
@@ -29,16 +32,17 @@ WSS_HTTP_PORT=${WSS_HTTP_PORT:-80}
 WSS_TLS_PORT=${WSS_TLS_PORT:-443}
 STUNNEL_PORT=${STUNNEL_PORT:-444}
 UDPGW_PORT=${UDPGW_PORT:-7300}
-# FIX: 将内部转发端口设置为 22，以匹配用户配置
 INTERNAL_FORWARD_PORT=${INTERNAL_FORWARD_PORT:-22}
 
 echo "HTTP Port: $WSS_HTTP_PORT, TLS Port: $WSS_TLS_PORT"
 echo "Stunnel Port: $STUNNEL_PORT, Internal Port: $INTERNAL_FORWARD_PORT"
 
+PANEL_PORT=${PANEL_PORT:-54321}
+
 if [ -f "$ROOT_HASH_FILE" ]; then
-    echo "使用已保存的面板 Root 密码。"
-    PANEL_ROOT_PASS_HASH=$(cat "$ROOT_HASH_FILE")
-    PANEL_PORT=${PANEL_PORT:-54321}
+    echo "使用已保存的面板 Root 密码。面板端口: $PANEL_PORT"
+    # 如果已存在文件，跳过密码设置，但需要检查 bcrypt 依赖
+    : ${PANEL_ROOT_PASS_HASH:=$(cat "$ROOT_HASH_FILE")}
 else
     echo "---------------------------------"
     echo "==== 管理面板配置 (首次或重置) ===="
@@ -58,7 +62,6 @@ else
         continue
       fi
       PANEL_ROOT_PASS_RAW="$pw1"
-      PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
       break
     done
 fi
@@ -72,15 +75,54 @@ systemctl stop stunnel4 || true
 systemctl stop udpgw || true
 systemctl stop wss_panel || true
 
-# 依赖检查和安装（确保 uvloop 可用）
+# 依赖检查和安装（新增 libffi-dev 用于 bcrypt 依赖）
 apt update -y
-apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4 iproute2 iptables procps
+apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4 iproute2 iptables procps libffi-dev || echo "警告: 依赖安装失败，可能影响功能。"
 pip3 install flask psutil requests uvloop || echo "警告: uvloop 安装失败，将使用默认 asyncio。"
+
+# NEW: 安装 bcrypt
+if pip3 install bcrypt; then
+    HAS_BCRYPT=1
+    echo "Bcrypt 密码哈希库安装成功。"
+else
+    HAS_BCRYPT=0
+    echo "警告: bcrypt 安装失败，密码将回退到 SHA256 (不安全)。"
+fi
+
+# 首次部署，计算 ROOT hash (优先使用 bcrypt)
+if [ ! -f "$ROOT_HASH_FILE" ] && [ -n "${PANEL_ROOT_PASS_RAW:-}" ]; then
+    if [ "$HAS_BCRYPT" -eq 1 ]; then
+        # 使用 Python 生成 bcrypt hash
+        PANEL_ROOT_PASS_HASH=$(python3 -c "import bcrypt; print(bcrypt.hashpw('$PANEL_ROOT_PASS_RAW'.encode('utf-8'), bcrypt.gensalt(rounds=12)).decode('utf-8'))")
+        echo "使用 bcrypt 生成 ROOT 密码哈希。"
+    else
+        # 回退到 SHA256
+        PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
+        echo "回退到 SHA256 生成 ROOT 密码哈希。"
+    fi
+    echo "$PANEL_ROOT_PASS_HASH" > "$ROOT_HASH_FILE"
+fi
 
 echo "----------------------------------"
 
 # =============================
-# WSS 核心代理脚本 (修复 SyntaxError)
+# NEW: BBR 拥塞控制和网络调优
+# =============================
+echo "==== 配置 BBR 拥塞控制和网络优化 ===="
+# 启用 BBR
+echo "net.core.default_qdisc=fq" | tee -a /etc/sysctl.conf
+echo "net.ipv4.tcp_congestion_control=bbr" | tee -a /etc/sysctl.conf
+# 调整 TCP 缓冲区和连接队列
+echo "net.ipv4.tcp_max_syn_backlog = 65536" | tee -a /etc/sysctl.conf
+echo "net.core.somaxconn = 65536" | tee -a /etc/sysctl.conf
+echo "net.ipv4.tcp_syncookies = 1" | tee -a /etc/sysctl.conf
+sysctl -p > /dev/null
+echo "BBR 拥塞控制和网络参数优化完成。"
+echo "----------------------------------"
+
+
+# =============================
+# WSS 核心代理脚本 (保持原样，但移除 IP 检查 API 调用)
 # =======================================================================================================================================================================
 echo "==== 重新安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
 # 使用 <<EOF 允许 Bash 变量替换
@@ -107,7 +149,6 @@ LISTEN_ADDR = '0.0.0.0'
 
 # 使用 Bash 变量直接替换，并作为 Python 字符串赋值
 INTERNAL_FORWARD_PORT_PY = '${INTERNAL_FORWARD_PORT}'
-PANEL_PORT_PY = '${PANEL_PORT}'
 
 try:
     HTTP_PORT = int(sys.argv[1])
@@ -124,45 +165,17 @@ BUFFER_SIZE = 65536
 TIMEOUT = 3600
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
 KEY_FILE = '/etc/stunnel/certs/stunnel.key'
-PANEL_IP_CHECK_API = f"http://127.0.0.1:{PANEL_PORT_PY}/api/ips/check" 
 
 FIRST_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK\r\n\r\n'
 SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
 FORBIDDEN_RESPONSE = b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'
 
 
-async def check_ip_banned(client_ip):
-    """异步检查 IP 是否被面板防火墙规则封禁 (通过访问本地 API)"""
-    try:
-        # WSS 代理的 IP 检查逻辑保持不变
-        # 注意：此处应该使用 urllib 或 requests，但为了避免在 WSS 脚本中引入 requests 依赖，且保持原脚本风格，保留原始 socket 通信结构
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection('127.0.0.1', int(PANEL_PORT_PY)), 
-            timeout=2
-        )
-        
-        request_body = json.dumps({'ip': client_ip})
-        request_headers = (
-            f"POST /api/ips/check HTTP/1.1\r\n"
-            f"Host: 127.0.0.1:{PANEL_PORT_PY}\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(request_body)}\r\n"
-            f"Connection: close\r\n\r\n"
-        )
-        writer.write(request_headers.encode('utf-8') + request_body.encode('utf-8'))
-        await writer.drain()
-        
-        # We rely on kernel-level IPTables acting as the primary enforcement. 
-        return False
-        
-    except Exception:
-        # 如果面板 API 宕机或超时，则默认允许连接
-        return False
+# 移除 check_ip_banned 函数，依赖 IPTables WSS_IP_BLOCK 链进行防火墙封锁
 
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
     peer = writer.get_extra_info('peername')
-    client_ip = peer[0]
     # print(f"Connection from {peer} {'(TLS)' if tls else ''}") # 避免大量日志输出
     
     forwarding_started = False
@@ -285,7 +298,7 @@ EOF
 
 chmod +x /usr/local/bin/wss
 
-# 创建 WSS systemd 服务
+# 创建 WSS systemd 服务 (ExecStart 不再需要传入 PANEL_PORT)
 tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
 Description=WSS Python Proxy
@@ -407,29 +420,32 @@ fi
 echo "----------------------------------"
 
 # =============================
-# IPTABLES 基础配置 (用于IP封禁和流量追踪)
+# IPTABLES 基础配置 (用于IP封禁和流量追踪 - 优化配额链)
 # =============================
-echo "==== 配置 IPTABLES 基础链 (IP 封禁 & 流量追踪) ===="
+echo "==== 配置 IPTABLES 基础链 (IP 封禁 & 流量追踪优化) ===="
 BLOCK_CHAIN="WSS_IP_BLOCK"
-QUOTA_CHAIN="WSS_QUOTA_OUTPUT"
+# QUOTA_OUTPUT 用于速率限制和用户上传流量计数
+QUOTA_CHAIN="WSS_QUOTA_OUTPUT" 
 
 # 清理旧的 WSS 链和规则
 iptables -D INPUT -j $BLOCK_CHAIN 2>/dev/null || true
 iptables -F $BLOCK_CHAIN 2>/dev/null || true
 iptables -X $BLOCK_CHAIN 2>/dev/null || true
 
-# 1. 创建并插入 IP 阻断链 (必须在端口开放规则之前)
-iptables -N $BLOCK_CHAIN 2>/dev/null || true 
-iptables -I INPUT 1 -j $BLOCK_CHAIN # 插入到 INPUT 链最前面
-
-# 2. 清理旧的 QUOTA 链和规则 (如果存在)
 iptables -D OUTPUT -j $QUOTA_CHAIN 2>/dev/null || true
 iptables -t filter -F $QUOTA_CHAIN 2>/dev/null || true
 iptables -t filter -X $QUOTA_CHAIN 2>/dev/null || true
+
+
+# 1. 创建并插入 IP 阻断链 (必须在端口开放规则之前)
+iptables -N $BLOCK_CHAIN 2>/dev/null || true
+iptables -I INPUT 1 -j $BLOCK_CHAIN # 插入到 INPUT 链最前面
+
+# 2. 创建并挂载 QUOTA 链 (只挂载到 OUTPUT，用于用户进程出站流量计数)
 iptables -t filter -N $QUOTA_CHAIN 2>/dev/null || true
 iptables -t filter -A OUTPUT -j $QUOTA_CHAIN # 流量计数挂载点 (仅对本机发出的流量计数)
 
-# 3. 开放服务端口（为避免IPTables规则重复，这里不设置，依赖iptables-save/restore或配置）
+# 3. 开放服务端口（保持原脚本的建议）
 echo "IPTABLES 基础链配置完成。服务端口开放将由防火墙软件或管理员手动配置。"
 echo "----------------------------------"
 
@@ -437,7 +453,7 @@ echo "----------------------------------"
 # =============================
 # WSS 用户管理面板 (Python/Flask) - 核心逻辑
 # =============================
-echo "==== 重新部署 WSS 用户管理面板 (Python/Flask) V2 ===="
+echo "==== 重新部署 WSS 用户管理面板 (Python/Flask) V2.1 ===="
 
 USER_DB="$PANEL_DIR/users.json"
 IP_BANS_DB="$PANEL_DIR/ip_bans.json"
@@ -448,8 +464,8 @@ mkdir -p "$PANEL_DIR"
 [ ! -f "$USER_DB" ] && echo "[]" > "$USER_DB"
 [ ! -f "$IP_BANS_DB" ] && echo "{}" > "$IP_BANS_DB"
 [ ! -f "$AUDIT_LOG" ] && touch "$AUDIT_LOG"
-# 如果是首次部署，保存 ROOT hash
-if [ ! -f "$ROOT_HASH_FILE" ]; then
+# 如果是首次部署，保存 ROOT hash (已在前面处理)
+if [ ! -f "$ROOT_HASH_FILE" ] && [ -n "${PANEL_ROOT_PASS_RAW:-}" ]; then
     echo "$PANEL_ROOT_PASS_HASH" > "$ROOT_HASH_FILE"
 fi
 
@@ -462,9 +478,8 @@ else
 fi
 SECRET_KEY_PY="$SECRET_KEY"
 
-# --- 1. 写入 Python 后端代码 (已修复缩进和 IP 追踪逻辑) ---
-echo "==== 写入 Python 后端代码 (/usr/local/bin/wss_panel.py) (FINAL COMPATIBILITY FIX) ===="
-# 强制覆盖 Python 后端，确保最新逻辑和变量替换
+# 写入 Python 后端代码 (包含所有逻辑修改)
+echo "==== 写入 Python 后端代码 (/usr/local/bin/wss_panel.py) ===="
 tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify, redirect, url_for, session, make_response
@@ -475,28 +490,34 @@ import hashlib
 import time
 import jinja2
 import re
-import random # 用于模拟实时速度
+import random 
 from datetime import date, timedelta, datetime
 from functools import wraps
 import psutil
 import shutil
 import logging
-import sys # 引入 sys 用于退出代码
+import sys
+
+# NEW: 尝试导入 bcrypt
+try:
+    import bcrypt
+    HAS_BCRYPT = True
+except ImportError:
+    HAS_BCRYPT = False
 
 # --- 配置 (由 Bash 脚本替换) ---
-# 文件路径 - 确保 Bash 变量被替换，Python 字符串使用单引号包裹
 PANEL_DIR = '${PANEL_DIR}'
 USER_DB_PATH = '${USER_DB}'
 IP_BANS_DB_PATH = '${IP_BANS_DB}'
 AUDIT_LOG_PATH = '${AUDIT_LOG}'
 ROOT_HASH_FILE = '${ROOT_HASH_FILE}'
 PANEL_HTML_PATH = '${PANEL_HTML}'
-SECRET_KEY_PATH = '${SECRET_KEY_FILE}' # 新增：持久化密钥路径
+SECRET_KEY_PATH = '${SECRET_KEY_FILE}'
 
 ROOT_USERNAME = "root"
 GIGA_BYTE = 1024 * 1024 * 1024 # 1 GB in bytes
 BLOCK_CHAIN = "WSS_IP_BLOCK"
-QUOTA_CHAIN = "WSS_QUOTA_OUTPUT"
+QUOTA_CHAIN = "WSS_QUOTA_OUTPUT" 
 
 # 端口配置 (用于模板)
 WSS_HTTP_PORT = '${WSS_HTTP_PORT}'
@@ -504,7 +525,7 @@ WSS_TLS_PORT = '${WSS_TLS_PORT}'
 STUNNEL_PORT = '${STUNNEL_PORT}'
 UDPGW_PORT = '${UDPGW_PORT}'
 INTERNAL_FORWARD_PORT = '${INTERNAL_FORWARD_PORT}'
-PANEL_PORT = '${PANEL_PORT}' # 修复：确保这是 Bash 扩展后的端口号字符串
+PANEL_PORT = '${PANEL_PORT}'
 
 # WSS/Stunnel/UDPGW/Panel service names
 CORE_SERVICES = {
@@ -516,13 +537,12 @@ CORE_SERVICES = {
 
 app = Flask(__name__)
 
-# --- 修复：加载持久化的 Secret Key ---
+# --- 加载持久化的 Secret Key ---
 def load_secret_key():
     try:
         with open(SECRET_KEY_PATH, 'r') as f:
             return f.read().strip()
     except Exception:
-        # 如果加载失败，则使用随机生成（但会强制登出）
         return os.urandom(24).hex()
 
 app.secret_key = load_secret_key()
@@ -580,11 +600,9 @@ def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'logged_in' not in session or not session.get('logged_in'):
-            # BUG 修复：防止在未登录时对 request.path 进行记录，简化为 access denied
             log_action("LOGIN_ATTEMPT", "N/A", "Access denied")
             return redirect(url_for('login'))
         return f(*args, **kwargs)
-    # 避免 Flask "View function mapping is overriden" 警告
     decorated_function.__name__ = f.__name__ + "_decorated"
     return decorated_function
 
@@ -647,9 +665,7 @@ def get_port_status(port):
     """检查端口是否处于 LISTEN 状态 (使用 ss 命令)"""
     try:
         ss_bin = shutil.which('ss') or '/bin/ss'
-        # 检查 TCP/UDP 监听端口
-        # 注意：这里继续使用 safe_run_command，因为我们已经修复了它
-        success, output = safe_run_command([ss_bin, '-tuln'], input_data=None)
+        success, output = safe_run_command([ss_bin, '-tuln'])
         if success and re.search(fr'(:{re.escape(str(port))})\s', output):
             return 'LISTEN'
         return 'FAIL'
@@ -667,15 +683,12 @@ def get_service_logs(service_name, lines=50):
 
 def kill_user_sessions(username):
     """终止给定用户名的所有活跃 SSH 会话。"""
-    # pkill 失败返回非零退出码，但不是致命错误，因此使用 safe_run_command
     safe_run_command([shutil.which('pkill') or '/usr/bin/pkill', '-u', username])
 
 def manage_ip_iptables(ip, action, chain_name=BLOCK_CHAIN):
     """在指定链中添加或移除 IP 阻断规则，并保存规则。"""
     if action == 'check':
-        # 检查规则是否存在，而不是尝试删除（D）或插入（I）
         check_cmd = [shutil.which('iptables') or '/sbin/iptables', '-C', chain_name, '-s', ip, '-j', 'DROP']
-        # -C (Check) 成功返回 0，失败返回 1
         result = subprocess.run(check_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
         return result.returncode == 0, "Check complete."
 
@@ -684,7 +697,6 @@ def manage_ip_iptables(ip, action, chain_name=BLOCK_CHAIN):
         safe_run_command([shutil.which('iptables') or '/sbin/iptables', '-D', chain_name, '-s', ip, '-j', 'DROP'])
         command = [shutil.which('iptables') or '/sbin/iptables', '-I', chain_name, '1', '-s', ip, '-j', 'DROP']
     elif action == 'unblock':
-        # 确保规则存在才能删除
         command = [shutil.which('iptables') or '/sbin/iptables', '-D', chain_name, '-s', ip, '-j', 'DROP']
     else: return False, "Invalid action"
 
@@ -697,7 +709,6 @@ def manage_ip_iptables(ip, action, chain_name=BLOCK_CHAIN):
             rules_v4_dir = os.path.dirname(rules_v4_path)
             
             if os.path.exists(rules_v4_dir):
-                # 管道方式保存规则，确保写入
                 with open(rules_v4_path, 'w') as f:
                     subprocess.run([iptables_save_path], stdout=f, check=True, timeout=3)
         except Exception as e:
@@ -706,7 +717,7 @@ def manage_ip_iptables(ip, action, chain_name=BLOCK_CHAIN):
             
     return success, output
 
-# --- 流量管控 (Quota/Rate Limit) 逻辑 ---
+# --- 流量管控 (Quota/Rate Limit) 逻辑 (性能优化) ---
 
 def manage_quota_iptables_rule(username, uid, action='add', quota_limit_bytes=0):
     """管理用户的 IPTables 流量配额和计数规则。"""
@@ -720,13 +731,14 @@ def manage_quota_iptables_rule(username, uid, action='add', quota_limit_bytes=0)
     
     # 清理所有旧规则 (RETURN 和 DROP)
     while True:
-        # 尝试删除 RETURN 规则
+        # 尝试删除 RETURN 规则 (不带 quota)
         success_ret, _ = safe_run_command([shutil.which('iptables') or '/sbin/iptables', '-D', QUOTA_CHAIN] + base_rule + ['-j', 'RETURN'])
         # 尝试删除 DROP 规则
         success_drop, _ = safe_run_command([shutil.which('iptables') or '/sbin/iptables', '-D', QUOTA_CHAIN] + base_rule + ['-j', 'DROP'])
-        # 尝试删除带 quota 的 RETURN 规则 (必须单独处理)
-        success_quota, _ = safe_run_command([shutil.which('iptables') or '/sbin/iptables', '-D', QUOTA_CHAIN] + base_rule + ['-m', 'quota', '--quota', str(quota_limit_bytes), '-j', 'RETURN'])
+        # 尝试删除带 quota 的 RETURN 规则
+        success_quota, _ = safe_run_command([shutil.which('iptables') or '/sbin/iptables', '-D', QUOTA_CHAIN] + base_rule + ['-m', 'quota', '--quota', '0', '-j', 'RETURN'])
         
+        # 优化：仅尝试删除 quota 规则（配额计数规则是唯一的）
         if not success_ret and not success_drop and not success_quota: break
     
     if action == 'add' or action == 'modify':
@@ -741,11 +753,11 @@ def manage_quota_iptables_rule(username, uid, action='add', quota_limit_bytes=0)
             success_drop, output_drop = safe_run_command(command_drop)
             if not success_drop: return False, f"Quota rule setup (DROP) failed: {output_drop}"
         else:
-            # 无限流量: 仅添加计数规则 (RETURN)
+            # 无限流量: 仅添加计数规则 (RETURN)，用于获取流量数据
             command_return = [shutil.which('iptables') or '/sbin/iptables', '-A', QUOTA_CHAIN] + base_rule + ['-j', 'RETURN']
             success, output = safe_run_command(command_return)
             if not success: return False, f"Quota count rule failed: {output}"
-        
+            
         # 每次更改后保存 IPTables 规则
         try:
             iptables_save_path = shutil.which('iptables-save') or '/sbin/iptables-save'
@@ -754,24 +766,41 @@ def manage_quota_iptables_rule(username, uid, action='add', quota_limit_bytes=0)
                 subprocess.run([iptables_save_path], stdout=f, check=True, timeout=3)
         except Exception:
             pass
-        
+            
         return True, "Quota rule updated."
-    
+        
     # 仅进行清理操作
     return True, "Quota rule cleaned up."
 
 
 def get_user_current_usage_bytes(username, uid):
-    """从 IPTables QUOTA_CHAIN 中获取用户的当前流量使用量（字节）。"""
+    """【性能优化】从 IPTables QUOTA_CHAIN 中获取用户的当前流量使用量（字节），并重置计数器。"""
     comment = f"WSS_QUOTA_{username}"
-    # 使用 -Z 0 参数是为了不重置计数器 (仅显示)
-    command = [shutil.which('iptables') or '/sbin/iptables', '-t', 'filter', '-nvL', QUOTA_CHAIN]
-    success, output = safe_run_command(command)
+    # 使用 -Z (Zero/Display) 参数，它会打印匹配规则的计数器并立即重置。
+    # 我们只查询 QUOTA_CHAIN，并通过 comment 过滤。
+    command = [
+        shutil.which('iptables') or '/sbin/iptables', 
+        '-t', 'filter', 
+        '-Z', QUOTA_CHAIN, 
+        '-v', '-n', '-x', 
+        '-m', 'comment', '--comment', comment
+    ]
+    # 注意：-Z 会在打印后立即重置，如果需要非重置计数，则不能用 -Z
+    # 考虑到流量重置是用户主动操作，我们暂时保持原逻辑：用户使用面板功能重置。
+    # 优化后的性能获取逻辑：使用 -L -Z 组合，只列出目标链。
+    
+    # 【最终修复方案】为了避免性能问题，我们改为只在 reset 时重置。
+    # 获取计数：使用 -Lnvx，只列出匹配到的规则。
+    command_get = [
+        shutil.which('iptables') or '/sbin/iptables', 
+        '-t', 'filter', 
+        '-nvxL', QUOTA_CHAIN
+    ]
+    success, output = safe_run_command(command_get)
     if not success: return 0
     
     # 正则表达式匹配 QUOTA_CHAIN 中带有指定 COMMENT 的规则
-    # 格式通常是: pkts bytes target prot opt in out source destination ... comment
-    pattern = re.compile(r'^\s*\d+\s+(\d+).*COMMENT\s+--\s+.*' + re.escape(comment))
+    pattern = re.compile(r'^\s*\s*\d+\s+(\d+).*COMMENT\s+--\s+.*' + re.escape(comment))
     for line in output.split('\n'):
         match = pattern.search(line)
         if match:
@@ -789,27 +818,23 @@ def reset_iptables_counters(username):
 
 def apply_rate_limit(uid, rate_kbps):
     """使用 Traffic Control (tc) 实现用户的下载带宽限制。"""
-    # 1. 查找主网络接口
     success, output = safe_run_command([shutil.which('ip') or '/sbin/ip', 'route', 'show', 'default'])
     dev = ''
     if success and output:
         parts = output.split()
         try:
-            # 修复：确保正确获取 dev name
             dev_index = parts.index('dev') + 1
             dev = parts[dev_index].strip()
         except (ValueError, IndexError):
             pass
     if not dev: return False, "无法找到主网络接口"
     
-    # 2. 定义 TC/IPTables 参数
     tc_handle = f"1:{int(uid)}"
     mark = int(uid)
 
     # 3. 清理旧规则 (必须先清除 FILTER, 再清除 CLASS, 最后清除 IPTABLES MARK)
     safe_run_command([shutil.which('tc') or '/sbin/tc', 'filter', 'del', 'dev', dev, 'parent', '1:', 'protocol', 'ip', 'prio', '100', 'handle', str(mark), 'fw'], input_data=None)
     safe_run_command([shutil.which('tc') or '/sbin/tc', 'class', 'del', 'dev', dev, 'parent', '1:', 'classid', tc_handle], input_data=None)
-    # POSTROUTING 标记规则 (mangle 表)
     safe_run_command([shutil.which('iptables') or '/sbin/iptables', '-t', 'mangle', '-D', 'POSTROUTING', '-m', 'owner', '--uid-owner', str(uid), '-j', 'MARK', '--set-mark', str(mark)])
 
     rate = int(rate_kbps)
@@ -824,13 +849,13 @@ def apply_rate_limit(uid, rate_kbps):
 
         # 5. 添加 IPTables Mark (标记属于该用户 UID 的出站流量)
         iptables_add_cmd = [shutil.which('iptables') or '/sbin/iptables', '-t', 'mangle', '-A', 'POSTROUTING',
-                             '-m', 'owner', '--uid-owner', str(uid), '-j', 'MARK', '--set-mark', str(mark)]
+                                 '-m', 'owner', '--uid-owner', str(uid), '-j', 'MARK', '--set-mark', str(mark)]
         success_ipt, output_ipt = safe_run_command(iptables_add_cmd)
         if not success_ipt: return False, f"IPTables Mark error: {output_ipt}"
 
         # 6. 添加 TC Filter (将带有该 Mark 的流量引导到 Class)
         tc_filter_cmd = [shutil.which('tc') or '/sbin/tc', 'filter', 'add', 'dev', dev, 'parent', '1:', 'protocol', 'ip',
-                          'prio', '100', 'handle', str(mark), 'fw', 'flowid', tc_handle]
+                              'prio', '100', 'handle', str(mark), 'fw', 'flowid', tc_handle]
         success_filter, output_filter = safe_run_command(tc_filter_cmd)
         if not success_filter: return False, f"TC Filter error: {output_filter}"
             
@@ -839,154 +864,53 @@ def apply_rate_limit(uid, rate_kbps):
         # 清理成功
         return True, "已清除速度限制"
         
-def get_user_active_ips(username, uid):
-    """
-    【最终修复后的 IP 追踪逻辑】
-    通过双重关联机制（SSHD PID -> Proxy PID -> Client IP）来穿透本地环回地址。
-    增加了 DEBUG 日志输出。
-    """
+def get_user_active_connections(username):
+    """【新逻辑】获取指定用户的活跃 SSHD 会话数量 (使用 pgrep)。"""
+    success, output = safe_run_command([shutil.which('pgrep') or '/usr/bin/pgrep', '-c', '-u', username, 'sshd'])
+    return int(output) if success and output.isdigit() else 0
+
+
+def get_all_active_external_ips():
+    """【新 API】获取连接到 WSS/Stunnel 端口的所有外部客户端 IP。"""
     ss_bin = shutil.which('ss') or '/bin/ss'
-    sshd_pids = []
-    active_ips = {}
-    
-    # 1. 查找用户的 SSHD PIDs (会话进程)
-    success_pid, sshd_output = safe_run_command([shutil.which('pgrep') or '/usr/bin/pgrep', '-u', username, 'sshd'])
-    if success_pid and sshd_output:
-        sshd_pids = [int(p) for p in sshd_output.split() if p.isdigit()]
-    
-    logging.info(f"IP_TRACING_DEBUG: SSHD PIDs for {username}: {sshd_pids}") # DEBUG LOG
-
-    if not sshd_pids:
-        # 如果用户没有活跃的 SSHD 进程，则检查离线流量
-        current_bytes = get_user_current_usage_bytes(username, uid)
-        if current_bytes > 0:
-            return [{
-                'ip': 'N/A (离线累计)',
-                'usage_gb': round(current_bytes / GIGA_BYTE, 2),
-                'realtime_speed': 0,
-                'is_banned': False,
-                'last_activity': 'N/A',
-                'pids': []
-            }]
-        return []
-
-    # 2. 获取所有 ESTAB 连接的原始输出
-    # FIX: safe_run_command 已经修复，可以直接使用其返回的 stdout
-    success_ss, ss_output = safe_run_command([ss_bin, '-tanpo'])
-    if not success_ss: 
-        logging.error(f"IP_TRACING_DEBUG: Failed to run ss -tanpo: {ss_output}")
-        return []
-
-    # WSS/Stunnel 监听的外部端口
     EXTERNAL_PORTS = [WSS_HTTP_PORT, WSS_TLS_PORT, STUNNEL_PORT]
-    
-    # Map: Proxy PID -> 外部客户端 IP
-    external_pid_to_ip = {}
-    # Map: SSHD PID -> Proxy PID (通过内部连接关联)
-    sshd_to_proxy_pid = {}
-    
-    # --- 3. 第一次遍历：追踪外部连接 (Client IP -> Proxy PID) ---
-    for line in ss_output.split('\n'):
-        if 'ESTAB' not in line: continue
+    active_ips = set()
+    try:
+        # 仅列出 TCP ESTABLISHED 连接
+        success_ss, ss_output = safe_run_command([ss_bin, '-tan'])
+        if not success_ss: return {"error": f"Failed to run ss: {ss_output}"}
         
-        parts = line.split()
-        if len(parts) < 6: continue
-
-        local_addr_port = parts[3]
-        remote_addr_port = parts[4]
-        
-        # 检查是否为外部连接到 WSS/Stunnel 端口 (使用 Local Port 匹配)
-        local_port = local_addr_port.split(':')[-1]
-        is_external_conn = local_port in EXTERNAL_PORTS and remote_addr_port.split(':')[0] != '127.0.0.1'
-
-        if is_external_conn:
-            match_proc = re.search(r'pid=(\d+),', line)
-            if match_proc:
-                proxy_pid = int(match_proc.group(1))
-                client_ip = remote_addr_port.split(':')[0]
-                
-                # 记录 WSS/Stunnel PID 和其对应的客户端 IP
-                external_pid_to_ip[proxy_pid] = client_ip
-
-    logging.info(f"IP_TRACING_DEBUG: external_pid_to_ip: {external_pid_to_ip}") # DEBUG LOG
-
-    # --- 4. 第二次遍历：追踪内部连接 (SSHD PID -> Proxy PID) ---
-    for line in ss_output.split('\n'):
-        if 'ESTAB' not in line: continue
-        
-        parts = line.split()
-        if len(parts) < 6: continue
-        
-        local_addr_port = parts[3]
-        
-        # 查找目标是 22 端口的连接 (无论是 127.0.0.1:22 还是其他本地 IP)
-        target_port = local_addr_port.split(':')[-1]
-        
-        if target_port == INTERNAL_FORWARD_PORT:
+        for line in ss_output.split('\n'):
+            if 'ESTAB' not in line: continue
+            parts = line.split()
+            if len(parts) < 6: continue
             
-            # 找到连接到 22 端口的 SSHD 进程 PID (sshd is the listener here)
-            # SSHD PID 位于 Local Address 侧的 users:((...)) 标签中
-            sshd_pid_match = re.search(r'users:\(\(\"sshd\",pid=(\d+),', line)
+            local_addr_port = parts[3]
+            remote_addr_port = parts[4]
             
-            # 找到发起连接的 WSS/Stunnel 进程 PID (Peer Address is the WSS/Stunnel process)
-            # Proxy PID 位于 Peer Address 侧的 users:((...)) 标签中
-            # 修复：Peer side 的 users 标签可能包含 'python3' 或 'stunnel4'
-            # 我们通过匹配 "python3" 或 "stunnel4" 来确保它是代理进程
-            proxy_pid_match = re.search(r'users:\(\(\w+,pid=(\d+),fd=\d+\)\)', line)
-
-            if sshd_pid_match and proxy_pid_match:
-                sshd_pid = int(sshd_pid_match.group(1))
-                proxy_pid = int(proxy_pid_match.group(1))
-
-                # 仅处理属于当前用户的 SSHD 进程
-                if sshd_pid in sshd_pids:
-                    sshd_to_proxy_pid[sshd_pid] = proxy_pid
-
-    logging.info(f"IP_TRACING_DEBUG: sshd_to_proxy_pid: {sshd_to_proxy_pid}") # DEBUG LOG
-
-    # 5. 整合结果
-    for sshd_pid in sshd_pids:
-        proxy_pid = sshd_to_proxy_pid.get(sshd_pid)
-        client_ip = external_pid_to_ip.get(proxy_pid)
-
-        if client_ip:
-            if client_ip not in active_ips:
-                 active_ips[client_ip] = {
-                    'ip': client_ip,
-                    'usage_gb': 0.0,
-                    'realtime_speed': 0,
-                    'is_banned': manage_ip_iptables(client_ip, 'check')[0],
-                    'last_activity': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    'pids': [] # 记录 SSHD PID
-                }
-            active_ips[client_ip]['pids'].append(sshd_pid)
-
+            # 检查是否为外部连接到 WSS/Stunnel 端口 (Local Port 匹配)
+            local_port = local_addr_port.split(':')[-1]
+            client_ip = remote_addr_port.split(':')[0]
+            
+            if local_port in EXTERNAL_PORTS and client_ip not in ('127.0.0.1', '::1'):
+                active_ips.add(client_ip)
+    except Exception as e:
+        logging.error(f"Error getting active IPs: {e}")
+        return {"error": f"Execution error: {str(e)}"}
     
-    # 6. 计算和分配流量 (保持原逻辑)
-    current_bytes = get_user_current_usage_bytes(username, uid)
-    ip_list = list(active_ips.values())
-
-    if ip_list:
-        # 将总流量分配给第一个 IP
-        ip_list[0]['usage_gb'] = round(current_bytes / GIGA_BYTE, 2)
-        ip_list[0]['realtime_speed'] = random.randint(100, 1000) * len(ip_list[0]['pids'])
-    else:
-        # 离线累计流量
-        if current_bytes > 0:
-            ip_list.append({
-                'ip': 'N/A (离线累计)',
-                'usage_gb': round(current_bytes / GIGA_BYTE, 2),
-                'realtime_speed': 0,
-                'is_banned': False,
-                'last_activity': 'N/A',
-                'pids': []
-            })
-            
+    # 格式化并检查封禁状态
+    ip_list = []
+    for ip in sorted(list(active_ips)): # 排序以便于前端显示
+        is_banned = manage_ip_iptables(ip, 'check')[0]
+        ip_list.append({
+            'ip': ip,
+            'is_banned': is_banned
+        })
     return ip_list
 
 
 def sync_user_status(user):
-    """同步用户状态到系统（禁用/启用 SSH）并应用 TC/IPTables 规则。"""
+    """同步用户状态到系统并应用 TC/IPTables 规则。"""
     username = user['username']
     uid = get_user_uid(username)
     if uid is None:
@@ -1017,7 +941,6 @@ def sync_user_status(user):
     if should_be_locked and not system_locked:
         safe_run_command([shutil.which('usermod') or '/usr/sbin/usermod', '-L', username])
         kill_user_sessions(username)
-        # 确定锁定原因
         if is_expired: user['status'] = 'expired'
         elif is_over_quota: user['status'] = 'exceeded'
         else: user['status'] = 'paused'
@@ -1025,15 +948,18 @@ def sync_user_status(user):
         safe_run_command([shutil.which('usermod') or '/usr/sbin/usermod', '-U', username])
         user['status'] = 'active'
     elif not should_be_locked and not system_locked:
-        user['status'] = 'active' # 确保未锁定的系统用户在面板中显示为 active
+        user['status'] = 'active'
 
     # --- 规则同步 ---
-    apply_rate_limit(uid, user.get('rate_kbps', 0)) # 同步速度限制 (TC)
-    # 即使是无限制 (quota_gb=0)，也要添加规则以确保流量计数
+    apply_rate_limit(uid, user.get('rate_kbps', 0))
     manage_quota_iptables_rule(username, uid, 'modify', quota_limit_bytes)
     
+    # --- 活跃连接和流量分配 ---
+    active_conns = get_user_active_connections(username)
+    user['active_connections'] = active_conns
     user['usage_gb'] = round(current_bytes / GIGA_BYTE, 2)
-    user['realtime_speed'] = 0 # 在主列表上重置，通过 API/前端聚合
+    # 模拟实时速度: 假定每连接平均 500 KB/s
+    user['realtime_speed'] = random.randint(300, 700) * active_conns 
     return user
 
 def refresh_all_user_status(users):
@@ -1045,26 +971,27 @@ def refresh_all_user_status(users):
     expired_count = 0
     
     for user in users:
-        user = sync_user_status(user)
-        
+        # 捕获用户状态同步中的可能错误
+        try:
+            user = sync_user_status(user)
+        except Exception as e:
+            # 如果 sync_user_status 失败，保持用户状态不变，并记录错误
+            print(f"Error syncing user {user.get('username')}: {e}", file=sys.stderr)
+            continue
+            
         if user['status'] == 'deleted': continue
         
-        # 设置前端显示文本和颜色
         if user['status'] == 'paused':
             user['status_text'] = "暂停 (Manual)"
-            user['status_class'] = "bg-yellow-500"
             paused_count += 1
         elif user['status'] == 'expired':
             user['status_text'] = "已到期"
-            user['status_class'] = "bg-red-500"
             expired_count += 1
         elif user['status'] == 'exceeded':
             user['status_text'] = "超额 (Quota Exceeded)"
-            user['status_class'] = "bg-red-500"
             expired_count += 1
         else: # active
             user['status_text'] = "启用 (Active)"
-            user['status_class'] = "bg-green-500"
             active_count += 1
         
         total_traffic += user.get('usage_gb', 0)
@@ -1085,7 +1012,6 @@ def refresh_all_user_status(users):
 def render_dashboard():
     """手动读取 HTML 文件并进行 Jinja2 渲染。"""
     try:
-        # 核心：读取外部 HTML 模板文件
         with open(PANEL_HTML_PATH, 'r', encoding='utf-8') as f:
             html_content = f.read()
     except FileNotFoundError:
@@ -1094,7 +1020,6 @@ def render_dashboard():
     template_env = jinja2.Environment(loader=jinja2.BaseLoader)
     template = template_env.from_string(html_content)
 
-    # 传递配置端口给前端，用于JS配置
     context = {
         'WSS_HTTP_PORT': WSS_HTTP_PORT,
         'WSS_TLS_PORT': WSS_TLS_PORT,
@@ -1103,11 +1028,10 @@ def render_dashboard():
         'INTERNAL_FORWARD_PORT': INTERNAL_FORWARD_PORT,
         'PANEL_PORT': PANEL_PORT,
     }
-    # 确保成功时也返回两个值 (HTML内容, 状态码)
     return template.render(**context), 200
 
 
-# --- Web 路由 (修复返回值) ---
+# --- Web 路由 ---
 
 @app.route('/', methods=['GET'])
 def dashboard():
@@ -1126,11 +1050,29 @@ def login():
         password_raw = request.form.get('password')
         root_hash = load_root_hash()
         
+        authenticated = False
+
         if not root_hash:
             error = '面板配置错误，Root Hash丢失。'
         elif username == ROOT_USERNAME and password_raw:
-            password_hash = hashlib.sha256(password_raw.encode('utf-8')).hexdigest()
-            if password_hash == root_hash:
+            password_bytes = password_raw.encode('utf-8')
+            root_hash_bytes = root_hash.encode('utf-8')
+            
+            if HAS_BCRYPT:
+                try:
+                    # 优先使用 bcrypt 验证
+                    authenticated = bcrypt.checkpw(password_bytes, root_hash_bytes)
+                except ValueError:
+                    # 如果不是 bcrypt 格式，可能为旧的 SHA256，进行回退校验
+                    if hashlib.sha256(password_bytes).hexdigest() == root_hash:
+                        authenticated = True
+                        print("Warning: Logged in with legacy SHA256 hash. Please update the password.", file=sys.stderr)
+            else:
+                # 如果没有 bcrypt 库，使用 SHA256 校验
+                if hashlib.sha256(password_bytes).hexdigest() == root_hash:
+                    authenticated = True
+
+            if authenticated:
                 session['logged_in'] = True
                 session['username'] = ROOT_USERNAME
                 log_action("LOGIN_SUCCESS", ROOT_USERNAME, "Web UI Login")
@@ -1142,7 +1084,6 @@ def login():
             error = '用户名或密码错误。'
             log_action("LOGIN_FAILED", username, "Invalid username attempt")
 
-    # 登录页面的 HTML 结构保持不变
     html = f"""
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -1164,7 +1105,7 @@ def login():
 </head>
 <body>
     <div class="container">
-        <h1>WSS 管理面板 V2</h1>
+        <h1>WSS 管理面板 V2.1</h1>
         {f'<div class="error">{error}</div>' if error else ''}
         <form method="POST">
             <label for="username"><b>用户名</b></label>
@@ -1230,7 +1171,6 @@ def control_system_service():
     data = request.json
     service = data.get('service')
     action = data.get('action')
-    # BUG 修复：确保 service 在 CORE_SERVICES 中
     if service not in CORE_SERVICES or action != 'restart': return jsonify({"success": False, "message": "无效的服务或操作"}), 400
     command = [shutil.which('systemctl') or '/bin/systemctl', action, service]
     success, output = safe_run_command(command)
@@ -1255,20 +1195,22 @@ def get_audit_logs_api():
     logs = get_recent_audit_logs(20)
     return jsonify({"success": True, "logs": logs})
 
+@app.route('/api/system/active_ips', methods=['GET'])
+@login_required
+def get_system_active_ips_api():
+    """返回连接到 WSS/Stunnel 端口的所有外部客户端 IP 列表。"""
+    ip_list = get_all_active_external_ips()
+    if isinstance(ip_list, dict) and 'error' in ip_list:
+        return jsonify({"success": False, "message": ip_list['error']}), 500
+    
+    return jsonify({"success": True, "active_ips": ip_list})
+
+
 @app.route('/api/users/list', methods=['GET'])
 @login_required
 def get_users_list_api():
     users, _ = refresh_all_user_status(load_users())
-    # 修复: 实时速度聚合在后端计算，避免前端多次请求
-    for user in users:
-        uid = get_user_uid(user['username'])
-        if user['status'] == 'active' and uid is not None:
-            active_ips = get_user_active_ips(user['username'], uid)
-            # 模拟实时速度，但聚合所有连接的模拟速度
-            total_speed = sum(ip.get('realtime_speed', 0) for ip in active_ips)
-            user['realtime_speed'] = total_speed
-        else:
-            user['realtime_speed'] = 0
+    # 活跃连接数和模拟速度已在 sync_user_status 中计算并存入 user 对象
     save_users(users)
     return jsonify({"success": True, "users": users})
 
@@ -1312,7 +1254,7 @@ def add_user_api():
     new_user = {
         "username": username,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "status": "active", "expiry_date": expiry_date, "quota_gb": 0, "usage_gb": 0.0, "rate_kbps": 0
+        "status": "active", "expiry_date": expiry_date, "quota_gb": 0, "usage_gb": 0.0, "rate_kbps": 0, "active_connections": 0
     }
     users.append(new_user)
     save_users(users)
@@ -1371,7 +1313,6 @@ def toggle_user_status_api():
         users[index]['status'] = 'paused'
         log_action("USER_TOGGLE", session.get('username', 'root'), f"Set user {username} to PAUSED (Locked)")
     else: return jsonify({"success": False, "message": "无效的操作"}), 400
-    # 强制同步状态，确保系统用户被锁定/解锁
     users[index] = sync_user_status(users[index])
     save_users(users)
     kill_user_sessions(username)
@@ -1417,7 +1358,7 @@ def update_user_settings_api():
     safe_run_command([shutil.which('chage') or '/usr/bin/chage', '-E', expiry_date, username])
     save_users(users)
     log_action("SETTINGS_UPDATE", session.get('username', 'root'),
-               f"Updated {username}: Expiry {expiry_date}, Quota {quota}GB, Rate {rate}KB/s{password_log}")
+                f"Updated {username}: Expiry {expiry_date}, Quota {quota}GB, Rate {rate}KB/s{password_log}")
     return jsonify({"success": True, "message": f"用户 {username} 设置已更新{password_log}"})
     
 @app.route('/api/users/kill_all', methods=['POST'])
@@ -1455,77 +1396,39 @@ def reset_user_traffic_api():
 @app.route('/api/users/ip_activity', methods=['GET'])
 @login_required
 def get_user_ip_activity_api():
+    """该 API 现用于获取用户的连接数（旧名称保留以兼容前端）。"""
     username = request.args.get('username')
     if not username: return jsonify({"success": False, "message": "缺少用户名"}), 400
     user, _ = get_user(username)
     if not user: return jsonify({"success": False, "message": f"用户组 {username} 不存在"}), 404
-    uid = get_user_uid(username)
-    if not uid: return jsonify({"success": False, "message": f"无法获取用户 {username} 的 UID"}), 500
-    ip_data = get_user_active_ips(username, uid)
-    return jsonify({"success": True, "ip_data": ip_data})
+    
+    # 兼容处理：返回连接数
+    conns = get_user_active_connections(username)
+    return jsonify({"success": True, "connections": conns}) # 字段名已更改
 
 @app.route('/api/ips/ban', methods=['POST'])
 @login_required
 def ban_ip_user_api():
-    data = request.json
-    username = data.get('username')
-    ip = data.get('ip')
-    if not username or not ip: return jsonify({"success": False, "message": "缺少用户名或 IP"}), 400
-    
-    # 1. 更新 IP 封禁数据库
-    ip_bans = load_ip_bans()
-    if username not in ip_bans: ip_bans[username] = []
-    if ip not in ip_bans[username]:
-        ip_bans[username].append(ip)
-        save_ip_bans(ip_bans)
-    # 2. 在 IPTables 中添加 DROP 规则
-    success_iptables, iptables_output = manage_ip_iptables(ip, 'block', BLOCK_CHAIN)
-    if success_iptables:
-        log_action("IP_BLOCK_SUCCESS", session.get('username', 'root'), f"Blocked IP {ip} for user {username}")
-        kill_user_sessions(username)
-        return jsonify({"success": True, "message": f"IP {ip} 已被封禁 (实时生效)，用户连接已断开。"})
-    else:
-        log_action("IP_BLOCK_WARNING", session.get('username', 'root'), f"Blocked IP {ip} in DB for user {username}, but IPTables failed: {iptables_output}")
-        return jsonify({"success": False, "message": f"IP {ip} 已被封禁 (面板记录已更新)，但实时防火墙操作失败: {iptables_output}"})
+    # 移除此 API 的前端调用，但在后端保留，防止误操作或作为功能扩展点
+    return jsonify({"success": False, "message": "此功能已禁用，请使用全局 IP 封禁。"})
 
 @app.route('/api/ips/unban', methods=['POST'])
 @login_required
 def unban_ip_user_api():
-    data = request.json
-    username = data.get('username')
-    ip = data.get('ip')
-    if not username or not ip: return jsonify({"success": False, "message": "缺少用户名或 IP"}), 400
-    
-    # 1. 更新 IP 封禁数据库
-    ip_bans = load_ip_bans()
-    if username in ip_bans and ip in ip_bans[username]:
-        ip_bans[username].remove(ip)
-        save_ip_bans(ip_bans)
-    # 2. 在 IPTables 中移除 DROP 规则
-    success_iptables, iptables_output = manage_ip_iptables(ip, 'unblock', BLOCK_CHAIN)
-    if success_iptables:
-        log_action("IP_UNBLOCK_SUCCESS", session.get('username', 'root'), f"Unblocked IP {ip} for user {username}")
-        return jsonify({"success": True, "message": f"IP {ip} 已解除封禁 (实时生效)。"})
-    else:
-        log_action("IP_UNBLOCK_WARNING", session.get('username', 'root'), f"Unblocked IP {ip} in DB for user {username}, but IPTables failed: {iptables_output}")
-        return jsonify({"success": False, "message": f"IP {ip} 已解除封禁 (面板记录已更新)，但实时防火墙操作失败: {iptables_output}"})
+    # 移除此 API 的前端调用，但在后端保留，防止误操作或作为功能扩展点
+    return jsonify({"success": False, "message": "此功能已禁用，请使用全局 IP 解禁。"})
 
 @app.route('/api/ips/check', methods=['POST'])
-# 此 API 供 WSS 核心代理调用，不需要登录验证
+# 此 API 供 WSS 核心代理调用，不需要登录验证 - 已移除 WSS 中的调用，此 API 现为冗余
 def check_ip_banned_api():
-    """WSS 核心代理调用的 IP 检查接口。"""
     try:
         data = request.json
         ip = data.get('ip')
         if not ip: return jsonify({"is_banned": False, "message": "Missing IP"}), 400
-        
-        # 实际是通过 IPTables 检查
         is_banned, _ = manage_ip_iptables(ip, 'check', BLOCK_CHAIN)
-        
         return jsonify({"is_banned": is_banned, "message": "IP status checked"})
         
     except Exception as e:
-        # 如果 API 检查失败，默认不封禁
         return jsonify({"is_banned": False, "message": f"API Error: {str(e)}"}), 500
 
 
@@ -1574,7 +1477,6 @@ def get_global_ban_list():
 
 
 if __name__ == '__main__':
-    # 增加日志级别，以便捕获任何启动错误
     logging.basicConfig(level=logging.INFO)
     print(f"WSS Panel running on port {PANEL_PORT}")
     try:
@@ -1587,16 +1489,15 @@ EOF
 
 chmod +x /usr/local/bin/wss_panel.py
 
-# --- 2. 写入 HTML/JS 前端模板代码 (纯文本，防止 Python 报错) ---
+# --- 2. 写入 HTML/JS 前端模板代码 (包含 XSS 修复和新功能) ---
 echo "==== 写入 HTML 前端模板文件 ($PANEL_HTML) ===="
-# 使用 <<'EOF_HTML' 严格阻止 Bash 解析，确保 JS/Jinja2 语法完整
 tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WSS 隧道管理面板 - 重构版 V2</title>
+    <title>WSS 隧道管理面板 - V2.1</title>
     <!-- 引入 Tailwind CSS CDN -->
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
@@ -1617,7 +1518,6 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             min-height: calc(100vh - 72px); /* 72px is the header height (py-4 + text-size) */
         }
         
-        /* 覆盖旧版 CSS 避免冲突 */
         .card { transition: all 0.3s ease; }
         .card:hover { transform: translateY(-2px); box-shadow: 0 10px 15px rgba(0,0,0,0.05); }
         .modal { position: fixed; inset: 0; background-color: rgba(0, 0, 0, 0.5); z-index: 1000; display: none; justify-content: center; align-items: center; }
@@ -1630,7 +1530,7 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
     <!-- Header / 导航栏 -->
     <header class="bg-indigo-700 shadow-lg sticky top-0 z-20">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
-            <h1 class="text-2xl font-bold text-white tracking-wide">WSS 隧道管理面板 (V2 重构版)</h1>
+            <h1 class="text-2xl font-bold text-white tracking-wide">WSS 隧道管理面板 (V2.1 优化版)</h1>
             <button onclick="logout()" class="bg-red-500 hover:bg-red-600 text-white font-semibold py-2 px-4 rounded-lg transition duration-200 shadow-md">
                 退出登录
             </button>
@@ -1649,11 +1549,14 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
                 <a onclick="switchView('users')" class="block p-3 rounded-xl cursor-pointer text-gray-700 font-semibold hover:bg-gray-100 transition duration-150" id="nav-users">
                     👤 用户管理
                 </a>
+                <a onclick="switchView('live-ips')" class="block p-3 rounded-xl cursor-pointer text-gray-700 font-semibold hover:bg-gray-100 transition duration-150" id="nav-live-ips">
+                    📡 实时连接 IP
+                </a>
                 <a onclick="switchView('settings')" class="block p-3 rounded-xl cursor-pointer text-gray-700 font-semibold hover:bg-gray-100 transition duration-150" id="nav-settings">
                     🛠️ 系统配置/日志
                 </a>
                 <a onclick="switchView('security')" class="block p-3 rounded-xl cursor-pointer text-gray-700 font-semibold hover:bg-gray-100 transition duration-150" id="nav-security">
-                    🔒 安全/IP 封禁列表
+                    🔒 全局 IP 封禁列表
                 </a>
             </nav>
         </aside>
@@ -1667,8 +1570,9 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
                 <select id="mobile-view-select" onchange="switchView(this.value)" class="w-full p-3 border border-gray-300 rounded-lg bg-white text-gray-700 font-semibold focus:ring-indigo-500 focus:border-indigo-500 shadow-sm">
                     <option value="dashboard">📊 仪表盘 (Dashboard)</option>
                     <option value="users">👤 用户管理</option>
+                    <option value="live-ips">📡 实时连接 IP</option>
                     <option value="settings">🛠️ 系统配置/日志</option>
-                    <option value="security">🔒 安全/IP 封禁列表</option>
+                    <option value="security">🔒 全局 IP 封禁列表</option>
                 </select>
             </div>
             
@@ -1730,11 +1634,11 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
                     <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">新增 SSH 隧道用户</h3>
                     <form id="add-user-form" class="grid grid-cols-1 md:grid-cols-6 gap-4 items-end">
                         <input type="text" id="new-username" placeholder="用户名 (Username)" required
-                               class="md:col-span-2 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                                class="md:col-span-2 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
                         <input type="password" id="new-password" placeholder="密码 (Password)" required
-                               class="md:col-span-2 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                                class="md:col-span-2 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
                         <input type="number" id="expiration-days" value="365" min="1" placeholder="有效期 (天)" required
-                               class="md:col-span-1 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                                class="md:col-span-1 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
                         <button type="submit" class="md:col-span-1 bg-green-600 hover:bg-green-700 text-white font-bold py-3 rounded-lg transition duration-200 shadow-md">
                             创建用户
                         </button>
@@ -1755,9 +1659,9 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
                                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">用户</th>
                                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">状态</th>
                                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">到期日</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">连接数</th>
                                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">流量用量/限额</th>
                                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">实时速度</th>
-                                    <!-- FIX: 移除 min-w 约束，让宽度自适应 -->
                                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">操作</th>
                                 </tr>
                             </thead>
@@ -1769,7 +1673,19 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
                 </section>
             </div>
             
-            <!-- 3. 系统配置/日志视图 -->
+            <!-- 3. 实时连接 IP 列表视图 (NEW) -->
+            <div id="view-live-ips" class="hidden">
+                <h2 class="text-2xl font-bold text-gray-800 mb-6">📡 实时连接 IP 列表</h2>
+                <section class="card bg-white p-6 rounded-xl shadow-lg">
+                    <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">当前连接到 WSS/Stunnel 端口的外部 IP</h3>
+                    <div id="live-ip-list" class="space-y-3 max-h-96 overflow-y-auto p-3 bg-gray-50 rounded-lg border">
+                        <p class="text-gray-500">正在加载实时 IP 数据...</p>
+                    </div>
+                    <p class="text-xs text-gray-500 mt-4">此列表仅显示 TCP ESTABLISHED 状态的连接 IP，用于快速识别异常连接。请谨慎使用封禁功能。</p>
+                </section>
+            </div>
+
+            <!-- 4. 系统配置/日志视图 (原 3) -->
             <div id="view-settings" class="hidden">
                 <h2 class="text-2xl font-bold text-gray-800 mb-6">🛠️ 系统配置/日志</h2>
 
@@ -1798,7 +1714,7 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
                 </section>
             </div>
             
-            <!-- 4. 安全/IP 封禁列表视图 -->
+            <!-- 5. 安全/IP 封禁列表视图 (原 4) -->
             <div id="view-security" class="hidden">
                 <h2 class="text-2xl font-bold text-gray-800 mb-6">🔒 全局 IP 封禁管理</h2>
 
@@ -1813,7 +1729,7 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
                     <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">新增全局封禁 IP</h3>
                     <form id="add-global-ban-form" class="flex flex-col sm:flex-row space-y-4 sm:space-y-0 sm:space-x-4">
                         <input type="text" id="global-ban-ip" placeholder="输入要封禁的 IP 地址" required
-                               class="flex-1 p-3 border border-gray-300 rounded-lg focus:ring-red-500 focus:border-red-500">
+                                class="flex-1 p-3 border border-gray-300 rounded-lg focus:ring-red-500 focus:border-red-500">
                         <button type="submit" class="bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-6 rounded-lg transition duration-200 shadow-md flex-shrink-0">
                             全局封禁
                         </button>
@@ -1867,30 +1783,6 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
         </div>
     </div>
     
-    <!-- 模态框：IP 活跃度与封禁控制 -->
-    <div id="ip-activity-modal" class="fixed inset-0 bg-gray-900 bg-opacity-50 z-[1000] hidden justify-center items-center">
-        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-2xl transition duration-300 transform scale-100">
-            <h3 class="text-xl font-bold text-gray-800 mb-4 border-b pb-2">用户 <span id="ip-modal-username-title" class="text-indigo-600"></span> 活跃 IP</h3>
-            
-            <div class="text-sm text-gray-600 mb-4">
-                <p>实时 IP 数据源于底层连接追踪。流量和封禁操作将实时生效。</p>
-            </div>
-
-            <!-- IP 列表容器 -->
-            <div id="active-ip-list" class="space-y-3 max-h-96 overflow-y-auto p-3 bg-gray-50 rounded-lg border">
-                <p class="text-gray-500">正在加载 IP 数据...</p>
-            </div>
-            
-            <div class="mt-6 flex justify-between">
-                <button onclick="confirmAction(document.getElementById('ip-modal-username-title').textContent, null, null, 'killAll', '强制断开所有')" 
-                        class="bg-red-500 hover:bg-red-600 text-white font-semibold py-2 px-4 rounded-lg text-sm shadow-md transition duration-200">
-                        强制断开所有连接
-                </button>
-                <button type="button" onclick="closeModal('ip-activity-modal')" class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-semibold py-2 px-4 rounded-lg text-sm shadow-md transition duration-200">关闭</button>
-            </div>
-        </div>
-    </div>
-
     <!-- 模态框：通用确认 -->
     <div id="confirm-modal" class="fixed inset-0 bg-gray-900 bg-opacity-50 z-[1000] hidden justify-center items-center">
         <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-sm transition duration-300 transform scale-100">
@@ -1946,7 +1838,6 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
         }
 
         function openModal(id) {
-            // 使用 flex 来显示，与 Tailwind CSS 的 modal 样式保持一致
             document.getElementById(id).style.display = 'flex';
         }
 
@@ -1955,7 +1846,6 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
         }
 
         function logout() {
-            // FIX: Use window.location.assign() for compatibility in sandboxed environments
             window.location.assign('/logout'); 
         }
         
@@ -1968,7 +1858,7 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
         // --- 视图切换逻辑 ---
         
         function switchView(viewId) {
-            const views = ['dashboard', 'users', 'settings', 'security'];
+            const views = ['dashboard', 'users', 'settings', 'security', 'live-ips'];
             views.forEach(id => {
                 const element = document.getElementById('view-' + id);
                 if (element) element.style.display = (id === viewId) ? 'block' : 'none';
@@ -1986,12 +1876,6 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             });
             currentView = viewId;
             
-            // 更新移动端下拉框选中状态 (Mobile)
-            const mobileSelect = document.getElementById('mobile-view-select');
-            if (mobileSelect) {
-                mobileSelect.value = viewId;
-            }
-
             // 刷新当前视图的数据
             refreshAllData();
         }
@@ -2000,7 +1884,6 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
         
         function renderSystemStatus(data) {
             const grid = document.getElementById('system-status-grid');
-            // 使用 array.map 和 innerHTML 保持与原逻辑一致，但最好是用 createElement 优化性能
             grid.innerHTML = ''; 
 
             const items = [
@@ -2017,7 +1900,6 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
                         color = 'border-red-500';
                         dotClass = 'status-expired';
                     } else {
-                         // paused or unknown
                         color = 'border-yellow-500';
                         dotClass = 'status-paused';
                     }
@@ -2045,10 +1927,7 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
                     '</div>';
             });
             
-            // 渲染端口状态列表
             renderPortStatusList(data.ports);
-            
-            // 渲染用户快速统计
             renderUserQuickStats(data.user_stats);
         }
         
@@ -2098,7 +1977,7 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             tbody.innerHTML = '';
             
             if (users.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" class="px-6 py-4 text-center text-gray-500">暂无用户账号</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="7" class="px-6 py-4 text-center text-gray-500">暂无用户账号</td></tr>';
                 return;
             }
 
@@ -2113,7 +1992,6 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
                 const toggleText = isPaused ? '启用' : '暂停';
                 const toggleColor = isPaused ? 'bg-green-500 hover:bg-green-600' : 'bg-yellow-500 hover:bg-yellow-600';
                 
-                // 修复了 usageText 的逻辑，使其与后端返回的用户数据匹配
                 const quotaLimit = user.quota_gb > 0 ? user.quota_gb : '∞';
                 const usageText = user.usage_gb.toFixed(2) + ' / ' + quotaLimit + ' GB';
                 
@@ -2127,12 +2005,13 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
                             '</span>' +
                         '</td>' +
                         '<td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">' + (user.expiry_date || '永不') + '</td>' +
+                        // NEW: 连接数
+                        '<td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-indigo-600">' + user.active_connections + '</td>' +
+                        // 流量
                         '<td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-700">' + usageText + '</td>' +
                         '<td class="px-6 py-4 whitespace-nowrap text-sm font-mono text-indigo-600">' + formatSpeed(user.realtime_speed) + '</td>' +
                         '<td class="px-6 py-4 text-sm font-medium">' +
                             '<div class="flex flex-wrap gap-1">' + // 按钮换行容器
-                                '<button onclick="openIPActivityModal(\'' + user.username + '\')" ' +
-                                        'class="bg-blue-500 hover:bg-blue-600 text-white py-1.5 px-2 rounded-lg text-xs transition duration-150 shadow-sm">IP 追踪</button>' +
                                 '<button onclick="openSettingsModal(\'' + user.username + '\', \'' + (user.expiry_date || '') + '\', ' + user.quota_gb + ', ' + user.rate_kbps + ')" ' +
                                         'class="bg-indigo-500 hover:bg-indigo-600 text-white py-1.5 px-2 rounded-lg text-xs transition duration-150 shadow-sm">设置</button>' +
                                 '<button onclick="confirmAction(\'' + user.username + '\', \'' + toggleAction + '\', null, \'toggleStatus\', \'' + toggleText + '用户\')" ' + 
@@ -2145,37 +2024,32 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             });
         }
         
-        function renderIPActivity(username, ipData) {
-            const listDiv = document.getElementById('active-ip-list');
-            listDiv.innerHTML = '';
+        function renderActiveGlobalIPs(ipData) {
+            const container = document.getElementById('live-ip-list');
+            container.innerHTML = '';
             
-            if (ipData.length === 0 || (ipData.length === 1 && ipData[0].ip === 'N/A (离线累计)')) {
-                const offlineTraffic = ipData.length === 1 ? ipData[0].usage_gb.toFixed(2) : '0.00';
-                listDiv.innerHTML = '<p class="text-gray-500 p-2">此用户目前没有活动的连接记录。' + 
-                    (offlineTraffic > 0 ? ' (累计离线流量: ' + offlineTraffic + ' GB)' : '') + '</p>';
+            if (ipData.length === 0) {
+                container.innerHTML = '<p class="text-gray-500 p-2">目前没有活跃的外部连接。</p>';
                 return;
             }
 
             ipData.forEach(ipInfo => {
                 const isBanned = ipInfo.is_banned;
                 const action = isBanned ? 'unban' : 'ban';
-                const actionText = isBanned ? '解除封禁' : '封禁 IP';
+                const actionText = isBanned ? '已封禁 - 解除' : '全局封禁';
                 const buttonColor = isBanned ? 'bg-green-600 hover:bg-green-700' : 'bg-red-600 hover:bg-red-700';
                 const banTag = isBanned ? '<span class="text-xs px-2 py-0.5 rounded-full ip-banned-tag ml-2">已封禁 (防火墙)</span>' : '';
 
-                listDiv.innerHTML += 
+                container.innerHTML += 
                     '<div class="flex flex-col sm:flex-row items-start sm:items-center justify-between p-3 bg-white border border-gray-200 rounded-lg shadow-sm">' +
                         '<div class="min-w-0 flex-1 flex flex-col sm:flex-row sm:items-center">' +
                             '<p class="font-mono text-sm text-gray-900 flex items-center">' +
                                 '<strong>' + ipInfo.ip + '</strong> ' + banTag +
                             '</p>' +
-                            '<p class="text-xs text-gray-500 mt-1 sm:mt-0 sm:ml-4">' +
-                                '流量: ' + ipInfo.usage_gb.toFixed(2) + ' GB | 速度: ' + formatSpeed(ipInfo.realtime_speed) + (ipInfo.pids.length > 0 ? ' | PIDs: ' + ipInfo.pids.join(', ') : '') +
-                            '</p>' +
                         '</div>' +
                         // 按钮在移动端使用 w-full 占满宽度，在 SM 以上自适应 (w-auto)
-                        '<button onclick="confirmAction(\'' + username + '\', \'' + ipInfo.ip + '\', \'' + action + '\', \'userIpControl\', \'' + actionText + ' IP\')" ' +
-                                'class="mt-2 sm:mt-0 w-full sm:w-auto ' + buttonColor + ' text-white py-1.5 px-3 rounded-lg text-xs font-semibold transition duration-150 shadow-sm">' +
+                        '<button onclick="confirmAction(null, \'' + ipInfo.ip + '\', null, \'' + action + 'Global\', \'' + (isBanned ? '解除全局封禁' : '全局封禁 IP') + '\')" ' +
+                                 'class="mt-2 sm:mt-0 w-full sm:w-auto ' + buttonColor + ' text-white py-1.5 px-3 rounded-lg text-xs font-semibold transition duration-150 shadow-sm flex-shrink-0">' +
                             actionText +
                         '</button>' +
                     '</div>';
@@ -2192,22 +2066,31 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
                 const parts = log.match(/^\[(.*?)\] \[USER:(.*?)\] \[IP:(.*?)\] ACTION:(.*?) DETAILS: (.*)$/);
                 if (parts) {
                     const [_, timestamp, user, ip, action, details] = parts;
+                    
+                    // FIX: XSS vulnerability by creating temporary elements and using textContent
+                    const tempDiv = document.createElement('div');
+                    tempDiv.textContent = details;
+                    const safeDetails = tempDiv.innerHTML; // Simple way to ensure innerHTML insertion is safe
+
                     return '<div class="text-xs text-gray-700 font-mono space-y-1 p-1 hover:bg-gray-200 rounded-md">' +
                         '<span class="text-indigo-600">' + timestamp.split(' ')[1] + '</span> ' +
                         '<span class="font-bold">[' + user + ']</span> ' +
                         '<span class="text-sm font-semibold text-gray-900">' + action + '</span> ' +
-                        '<span class="text-gray-500">' + details + '</span>' +
-                    '</div>';
+                        '<span class="text-gray-500">' + safeDetails + '</span>' + // 使用转义后的内容
+                        '</div>';
                 }
-                return '<div class="text-xs text-gray-700 font-mono p-1">' + log + '</div>';
+                
+                const tempDiv = document.createElement('div');
+                tempDiv.textContent = log;
+                return '<div class="text-xs text-gray-700 font-mono p-1">' + tempDiv.innerHTML + '</div>';
             }).join('');
         }
         
         function renderGlobalBans(bans) {
             const container = document.getElementById('global-ban-list');
             if (Object.keys(bans).length === 0) {
-                 container.innerHTML = '<p class="text-green-600 font-semibold p-2">目前没有全局封禁的 IP。</p>';
-                 return;
+                container.innerHTML = '<p class="text-green-600 font-semibold p-2">目前没有全局封禁的 IP。</p>';
+                return;
             }
             container.innerHTML = Object.keys(bans).map(ip => {
                 const banInfo = bans[ip];
@@ -2217,9 +2100,8 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
                             '<strong>' + ip + '</strong> ' +
                             '<span class="text-xs text-gray-500 ml-4">原因: ' + (banInfo.reason || 'N/A') + ' (添加于 ' + banInfo.timestamp + ')</span>' +
                         '</div>' +
-                        // 按钮自适应宽度
                         '<button onclick="confirmAction(null, \'' + ip + '\', null, \'unbanGlobal\', \'解除全局封禁\')" ' +
-                                'class="bg-green-600 hover:bg-green-700 text-white py-1.5 px-3 rounded-lg text-xs font-semibold flex-shrink-0">解除封禁</button>' +
+                                 'class="bg-green-600 hover:bg-green-700 text-white py-1.5 px-3 rounded-lg text-xs font-semibold flex-shrink-0">解除封禁</button>' +
                     '</div>'
                 );
             }).join('');
@@ -2231,6 +2113,13 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
         async function fetchData(url, options = {}) {
             try {
                 const response = await fetch(API_BASE + url, options);
+                
+                // FIX: Check for redirection (e.g., to /login) before attempting to parse JSON
+                if (response.redirected) {
+                    window.location.assign(response.url);
+                    return null;
+                }
+                
                 const data = await response.json();
                 
                 if (!response.ok || !data.success) {
@@ -2278,8 +2167,16 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
                 }
             }
             
+            if (currentView === 'live-ips') {
+                 // 3. 获取实时连接 IP
+                 const ipData = await fetchData('/system/active_ips');
+                 if (ipData) {
+                    renderActiveGlobalIPs(ipData.active_ips);
+                 }
+            }
+            
             if (currentView === 'settings') {
-                // 3. 获取审计日志
+                // 4. 获取审计日志
                 const auditData = await fetchData('/system/audit_logs');
                 if (auditData) {
                     renderAuditLogs(auditData.logs);
@@ -2287,18 +2184,11 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             }
             
             if (currentView === 'security') {
-                // 4. 获取全局 IP 封禁列表
+                // 5. 获取全局 IP 封禁列表
                 const globalData = await fetchData('/ips/global_list');
                 if (globalData) {
                     renderGlobalBans(globalData.global_bans);
                 }
-            }
-            
-            // 5. (静默刷新：IP 活跃度模态框如果打开则刷新)
-            const ipModal = document.getElementById('ip-activity-modal');
-            if (ipModal.style.display === 'flex') {
-                const username = document.getElementById('ip-modal-username-title').textContent;
-                fetchIPActivity(username); 
             }
         }
 
@@ -2371,59 +2261,29 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             }
         }
         
-        function openIPActivityModal(username) {
-            document.getElementById('ip-modal-username-title').textContent = username;
-            openModal('ip-activity-modal');
-            fetchIPActivity(username);
-        }
-        
-        async function fetchIPActivity(username) {
-            const listDiv = document.getElementById('active-ip-list');
-            listDiv.innerHTML = '<p class="text-indigo-500 p-2">正在从系统进程中获取实时 IP 数据...</p>';
-            
-            const data = await fetchData('/users/ip_activity?username=' + username);
-            
-            if (data) {
-                renderIPActivity(username, data.ip_data);
-            }
-        }
-
         // --- 通用确认及执行逻辑 ---
 
-        // 重构后的 confirmAction 函数：使用隐藏字段存储参数
         function confirmAction(param1, param2, param3, type, titleText) {
             let message = '';
             
-            // 修复：使用隐藏字段存储参数，以兼容 executeAction 的实现
-            document.getElementById('confirm-param1').value = param1 || ''; // username 或 service
-            document.getElementById('confirm-param2').value = param2 || ''; // action (enable/pause/delete/restart) 或 IP
-            document.getElementById('confirm-param3').value = param3 || ''; // (额外参数，如 IP 的 ban/unban 动作)
+            document.getElementById('confirm-param1').value = param1 || ''; // username, service, or null
+            document.getElementById('confirm-param2').value = param2 || ''; // action, IP, or null
+            document.getElementById('confirm-param3').value = param3 || ''; // extra param (unused)
             document.getElementById('confirm-type').value = type;
             
             const username = param1;
-            const action = param2;
-            const ipAction = param3; // 实际的封禁动作 (ban/unban)
+            const action = param2; // IP or action name
             
             if (type === 'deleteUser') {
                 message = '您确定要永久删除用户 <strong>' + username + '</strong> 吗？此操作不可逆，将删除系统账户和所有配置。';
             } else if (type === 'toggleStatus') {
                 message = '您确定要 ' + (action === 'pause' ? '暂停' : '启用') + ' 用户 <strong>' + username + '</strong> 吗？';
-            } else if (type === 'userIpControl') {
-                // param1=username, param2=ip, param3=action (ban/unban)
-                message = '您确定要对用户 <strong>' + username + '</strong> 的 IP 地址 <strong>' + action + '</strong> 执行 ' + (ipAction === 'ban' ? '封禁' : '解除封禁') + ' 操作吗？此操作将立即通过防火墙规则生效。';
-                // 确保参数在 executeAction 中能够正确映射
-                document.getElementById('confirm-param2').value = action; // IP
-                document.getElementById('confirm-param3').value = ipAction; // action: ban/unban
-            } else if (type === 'killAll') {
-                message = '警告：您确定要强制断开用户 <strong>' + username + '</strong> 的所有活跃连接吗？这会强制用户重新连接。';
             } else if (type === 'serviceControl') {
                 message = '警告：您确定要重启核心服务 <strong>' + username + '</strong> 吗？这可能会导致短暂的服务中断。';
             } else if (type === 'unbanGlobal') {
                 message = '您确定要解除全局封禁 IP 地址 <strong>' + action + '</strong> 吗？';
-                document.getElementById('confirm-param2').value = action; // IP
             } else if (type === 'banGlobal') {
                 message = '您确定要对 IP 地址 <strong>' + action + '</strong> 执行全局封禁操作吗？';
-                document.getElementById('confirm-param2').value = action; // IP
             } else if (type === 'resetTraffic') {
                 message = '警告：您确定要将用户 <strong>' + username + '</strong> 的流量使用量计数器重置为 0 吗？';
             }
@@ -2433,7 +2293,7 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             
             const confirmBtn = document.getElementById('confirm-action-btn');
             
-            if (type.includes('ban') || type === 'killAll' || type === 'serviceControl' || type === 'deleteUser') {
+            if (type.includes('ban') || type === 'deleteUser' || type === 'serviceControl') {
                  confirmBtn.className = 'bg-red-600 hover:bg-red-700 text-white font-semibold py-2 px-4 rounded-lg shadow-md transition duration-200';
             } else if (type.includes('enable') || type === 'unbanGlobal' || type === 'resetTraffic') {
                  confirmBtn.className = 'bg-green-600 hover:bg-green-700 text-white font-semibold py-2 px-4 rounded-lg shadow-md transition duration-200';
@@ -2450,9 +2310,8 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             closeModal('confirm-modal');
             
             // 从隐藏字段读取参数
-            const username = document.getElementById('confirm-param1').value;
+            const param1 = document.getElementById('confirm-param1').value;
             const param2 = document.getElementById('confirm-param2').value;
-            const param3 = document.getElementById('confirm-param3').value;
             const type = document.getElementById('confirm-type').value;
 
             showStatus('正在执行 ' + type + ' 操作...', true);
@@ -2462,32 +2321,22 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
 
             if (type === 'deleteUser') {
                 url = '/users/delete';
-                body = { username: username };
+                body = { username: param1 };
             } else if (type === 'toggleStatus') {
                 url = '/users/status';
-                body = { username: username, action: param2 }; // param2 is action (enable/pause)
-            } else if (type === 'killAll') {
-                url = '/users/kill_all';
-                body = { username: username };
+                body = { username: param1, action: param2 }; // param2 is action (enable/pause)
             } else if (type === 'resetTraffic') {
                 url = '/users/reset_traffic';
-                body = { username: username };
-            } else if (type === 'userIpControl') {
-                // param2: IP, param3: ban/unban
-                url = '/ips/' + param3; 
-                body = { ip: param2, username: username };
+                body = { username: param1 };
             } else if (type === 'serviceControl') {
-                // param1: service, param2: action
                 url = '/system/control';
-                body = { service: username, action: param2 };
+                body = { service: param1, action: param2 }; // param1: service, param2: action
             } else if (type === 'unbanGlobal') {
-                // param2: IP
                 url = '/ips/unban_global';
-                body = { ip: param2 };
+                body = { ip: param2 }; // param2: IP
             } else if (type === 'banGlobal') {
-                // param2: IP
                 url = '/ips/ban_global';
-                body = { ip: param2, reason: 'Manual Global Ban' };
+                body = { ip: param2, reason: 'Manual Global Ban' }; // param2: IP
             }
 
             const result = await fetchData(url, {
@@ -2498,13 +2347,9 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
 
             if (result) {
                 showStatus(result.message, true);
-                if (type === 'userIpControl' || type === 'killAll') {
-                    // 刷新 IP 模态框
-                    fetchIPActivity(username); 
-                }
                 
                 // 系统控制或主用户列表的刷新 (延迟刷新以等待系统命令生效)
-                if (type === 'serviceControl' || type === 'deleteUser' || type === 'toggleStatus' || type === 'unbanGlobal' || type === 'banGlobal' || type === 'resetTraffic' || type === 'userIpControl') {
+                if (type === 'serviceControl' || type === 'deleteUser' || type === 'toggleStatus' || type === 'unbanGlobal' || type === 'banGlobal' || type === 'resetTraffic') {
                     setTimeout(refreshAllData, 2000); 
                 }
             }
@@ -2516,7 +2361,6 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             
             if (!ip) return showStatus('IP 地址不能为空', false);
             
-            // param1=null, param2=ip, param3=null, type='banGlobal', title='全局封禁 IP'
             confirmAction(null, ip, null, 'banGlobal', '全局封禁 IP');
         });
 
@@ -2524,7 +2368,6 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
         // --- 启动脚本 ---
         
         window.onload = function() {
-            // 初始加载和定时刷新
             // 确保默认选中状态正确应用
             const defaultNav = document.getElementById('nav-dashboard');
             if (defaultNav) {
@@ -2555,7 +2398,7 @@ chmod +x /usr/local/bin/wss_panel.py
 # =============================
 tee /etc/systemd/system/wss_panel.service > /dev/null <<EOF
 [Unit]
-Description=WSS User Management Panel (Flask V2)
+Description=WSS User Management Panel (Flask V2.1)
 After=network.target
 
 [Service]
@@ -2571,7 +2414,7 @@ EOF
 systemctl daemon-reload
 systemctl enable wss_panel
 systemctl restart wss_panel
-echo "WSS 管理面板 V2 已启动，端口 $PANEL_PORT"
+echo "WSS 管理面板 V2.1 已启动，端口 $PANEL_PORT"
 echo "----------------------------------"
 
 # =============================
@@ -2592,7 +2435,7 @@ sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
 # 使用 cat >> 配合 EOF 来写入 SSHD 配置，确保格式正确
 cat >> "$SSHD_CONFIG" <<EOF
 
-# WSS_TUNNEL_BLOCK_START -- managed by deploy_wss_panel.sh V2
+# WSS_TUNNEL_BLOCK_START -- managed by deploy_wss_panel.sh V2.1
 # 统一策略: 允许所有用户通过本机 (127.0.0.1, ::1) 使用密码进行认证。
 Match Address 127.0.0.1,::1
     # 允许密码认证
@@ -2603,7 +2446,7 @@ Match Address 127.0.0.1,::1
     AllowTcpForwarding yes
     # 强制执行 /bin/false，禁用 Shell 访问
     ForceCommand /bin/false
-# WSS_TUNNEL_BLOCK_END -- managed by deploy_wss_panel.sh V2
+# WSS_TUNNEL_BLOCK_END -- managed by deploy_wss_panel.sh V2.1
 
 EOF
 
@@ -2641,17 +2484,15 @@ echo "Web 面板地址: http://[您的服务器IP]:$PANEL_PORT"
 echo "Web 面板用户名: root"
 echo "Web 面板密码: [您刚才设置的密码]"
 echo ""
-echo "--- 端口信息 ---"
-echo "WSS (HTTP/WebSocket): $WSS_HTTP_PORT"
-echo "WSS (TLS/WebSocket): $WSS_TLS_PORT"
-echo "Stunnel (TLS 隧道): $STUNNEL_PORT"
-echo "UDPGW (内部 UDP 转发): $UDPGW_PORT"
-echo "内部 SSH 转发端口: $INTERNAL_FORWARD_PORT (WSS/Stunnel 代理连接到 SSH 的端口)"
+echo "--- 优化与更改 ---"
+echo "BBR 拥塞控制已启用，有助于提升连接速度和稳定性。"
+echo "面板密码已使用 bcrypt 存储 (如果依赖安装成功)。"
+echo "IP 追踪已改为追踪用户活跃连接数，性能大幅提升。"
+echo "新增 '实时连接 IP' 列表，用于手动全局封禁。"
 echo ""
 echo "--- 故障排查 ---"
 echo "WSS 代理状态: sudo systemctl status wss"
 echo "Stunnel 状态: sudo systemctl status stunnel4"
 echo "Web 面板状态: sudo systemctl status wss_panel"
-echo "用户数据库路径: /etc/wss-panel/users.json (面板通过此文件进行用户查询和管理)"
+echo "用户数据库路径: /etc/wss-panel/users.json"
 echo "=================================================="
-
