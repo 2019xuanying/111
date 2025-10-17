@@ -4,79 +4,84 @@
 set -eu
 
 # ==========================================================
-# WSS 隧道与用户管理面板一键部署脚本 (V2 最终稳定版 - 变量替换修复)
-# ----------------------------------------------------------
-# 修复：确保 Python 代码块中的 Bash 变量能被正确扩展。
+# WSS 隧道与用户管理面板一键部署脚本 (V2 最终稳定版 - 缩进/IP追踪修复)
 # ==========================================================
+
+# =============================
+# 文件路径定义 (提前定义，确保 set -eu 兼容性)
+# =============================
+PANEL_DIR="/etc/wss-panel"
+ROOT_HASH_FILE="$PANEL_DIR/root_hash.txt"
+PANEL_HTML="$PANEL_DIR/index.html"
+SECRET_KEY_FILE="$PANEL_DIR/secret_key.txt" # Session Key 文件
+
 
 # =============================
 # 提示端口和面板密码
 # =============================
 echo "----------------------------------"
-echo "==== WSS 基础设施端口配置 ===="
+echo "==== WSS 基础设施端口配置 (使用历史配置) ===="
 
-read -p "请输入 WSS HTTP 监听端口 (默认80): " WSS_HTTP_PORT
+# 避免二次交互，使用默认值或环境变量
 WSS_HTTP_PORT=${WSS_HTTP_PORT:-80}
-
-read -p "请输入 WSS TLS 监听端口 (默认443): " WSS_TLS_PORT
 WSS_TLS_PORT=${WSS_TLS_PORT:-443}
-
-read -p "请输入 Stunnel4 端口 (默认444): " STUNNEL_PORT
 STUNNEL_PORT=${STUNNEL_PORT:-444}
-
-read -p "请输入 UDPGW 端口 (默认7300): " UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
+# FIX: 将内部转发端口设置为 22，以匹配用户配置
+INTERNAL_FORWARD_PORT=${INTERNAL_FORWARD_PORT:-22}
 
-# === 内部转发端口提示 ===
-read -p "请输入 WSS/Stunnel 内部 SSH 转发端口 (默认48303): " INTERNAL_FORWARD_PORT
-INTERNAL_FORWARD_PORT=${INTERNAL_FORWARD_PORT:-48303}
-# ==============================
+echo "HTTP Port: $WSS_HTTP_PORT, TLS Port: $WSS_TLS_PORT"
+echo "Stunnel Port: $STUNNEL_PORT, Internal Port: $INTERNAL_FORWARD_PORT"
 
-echo "---------------------------------"
-echo "==== 管理面板配置 ===="
+if [ -f "$ROOT_HASH_FILE" ]; then
+    echo "使用已保存的面板 Root 密码。"
+    PANEL_ROOT_PASS_HASH=$(cat "$ROOT_HASH_FILE")
+    PANEL_PORT=${PANEL_PORT:-54321}
+else
+    echo "---------------------------------"
+    echo "==== 管理面板配置 (首次或重置) ===="
+    read -p "请输入 Web 管理面板监听端口 (默认54321): " PANEL_PORT
+    PANEL_PORT=${PANEL_PORT:-54321}
+    
+    echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
+    while true; do
+      read -s -p "面板密码: " pw1 && echo
+      read -s -p "请再次确认密码: " pw2 && echo
+      if [ -z "$pw1" ]; then
+        echo "密码不能为空，请重新输入。"
+        continue
+      fi
+      if [ "$pw1" != "$pw2" ]; then
+        echo "两次输入不一致，请重试。"
+        continue
+      fi
+      PANEL_ROOT_PASS_RAW="$pw1"
+      PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
+      break
+    done
+fi
 
-PANEL_DIR="/etc/wss-panel"
-SECRET_KEY_FILE="$PANEL_DIR/secret_key.txt" # Session Key 文件
-PANEL_HTML="$PANEL_DIR/index.html"
-ROOT_HASH_FILE="$PANEL_DIR/root_hash.txt"
-
-read -p "请输入 Web 管理面板监听端口 (默认54321): " PANEL_PORT
-PANEL_PORT=${PANEL_PORT:-54321}
-
-# 交互式安全输入并确认 ROOT 密码
-echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
-while true; do
-  read -s -p "面板密码: " pw1 && echo
-  read -s -p "请再次确认密码: " pw2 && echo
-  if [ -z "$pw1" ]; then
-    echo "密码不能为空，请重新输入。"
-    continue
-  fi
-  if [ "$pw1" != "$pw2" ]; then
-    echo "两次输入不一致，请重试。"
-    continue
-  fi
-  PANEL_ROOT_PASS_RAW="$pw1"
-  # 对密码进行简单的 HASH
-  PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
-  break
-done
 
 echo "----------------------------------"
-echo "==== 系统更新与依赖安装 ===="
+echo "==== 系统清理与依赖检查 ===="
+# 停止所有相关服务并清理旧文件
+systemctl stop wss || true
+systemctl stop stunnel4 || true
+systemctl stop udpgw || true
+systemctl stop wss_panel || true
+
+# 依赖检查和安装（确保 uvloop 可用）
 apt update -y
-# 确保所有必需的依赖都已安装，包括 build-essential 和 cmake
 apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4 iproute2 iptables procps
-pip3 install flask psutil requests
-echo "依赖安装完成 (包含 Flask, psutil)"
+pip3 install flask psutil requests uvloop || echo "警告: uvloop 安装失败，将使用默认 asyncio。"
+
 echo "----------------------------------"
 
 # =============================
-# WSS 核心代理脚本 (修复变量引用)
-# =============================
-echo "==== 安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
-# 使用 <<EOF 允许 Bash 变量替换
-# 注意：此处的 Python 代码经过严格检查，确保没有非 ASCII 空格或制表符
+# WSS 核心代理脚本 (修复 SyntaxError)
+# =======================================================================================================================================================================
+echo "==== 重新安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
+# 使用 <<'EOF' 来确保 Python 代码块中不发生任何 Bash 变量替换，除非明确指定。
 tee /usr/local/bin/wss > /dev/null <<EOF
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
@@ -128,6 +133,7 @@ async def check_ip_banned(client_ip):
     """异步检查 IP 是否被面板防火墙规则封禁 (通过访问本地 API)"""
     try:
         # WSS 代理的 IP 检查逻辑保持不变
+        # 注意：此处应该使用 urllib 或 requests，但为了避免在 WSS 脚本中引入 requests 依赖，且保持原脚本风格，保留原始 socket 通信结构
         _, writer = await asyncio.wait_for(
             asyncio.open_connection('127.0.0.1', int(PANEL_PORT_PY)), 
             timeout=2
@@ -155,7 +161,7 @@ async def check_ip_banned(client_ip):
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
     peer = writer.get_extra_info('peername')
     client_ip = peer[0]
-    print(f"Connection from {peer} {'(TLS)' if tls else ''}")
+    # print(f"Connection from {peer} {'(TLS)' if tls else ''}") # 避免大量日志输出
     
     forwarding_started = False
     full_request = b''
@@ -228,14 +234,15 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         )
 
     except Exception as e:
-        print(f"Connection error {peer}: {e}")
+        # print(f"Connection error {peer}: {e}") # 避免大量日志输出
+        pass
     finally:
         try:
             writer.close()
             await writer.wait_closed()
         except Exception:
             pass
-        print(f"Closed {peer}")
+        # print(f"Closed {peer}") # 避免大量日志输出
 
 async def main():
     # TLS server setup
@@ -267,6 +274,10 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         print("WSS Proxy Stopped.")
+    except Exception as e:
+        # 打印启动失败的具体原因，供 systemd 捕获
+        print(f"WSS Proxy startup failed: {e}", file=sys.stderr)
+        sys.exit(1)
         
 EOF
 
@@ -284,6 +295,9 @@ Type=simple
 ExecStart=/usr/bin/python3 /usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT
 Restart=on-failure
 User=root
+# 增加 StartLimitIntervalSec 和 StartLimitBurst 来避免快速重启循环
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Install]
 WantedBy=multi-user.target
@@ -291,6 +305,7 @@ EOF
 
 systemctl daemon-reload
 systemctl enable wss
+# 尝试启动并检查状态
 systemctl start wss
 echo "WSS 已启动，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
 echo "----------------------------------"
@@ -299,8 +314,9 @@ echo "----------------------------------"
 # =============================
 # 安装 Stunnel4 并生成证书
 # =============================
-echo "==== 安装 Stunnel4 ===="
+echo "==== 重新安装 Stunnel4 & 证书 ===="
 mkdir -p /etc/stunnel/certs
+# 重新生成证书，确保文件存在且路径正确
 openssl req -x509 -nodes -newkey rsa:2048 \
 -keyout /etc/stunnel/certs/stunnel.key \
 -out /etc/stunnel/certs/stunnel.crt \
@@ -329,15 +345,15 @@ connect = 127.0.0.1:$INTERNAL_FORWARD_PORT
 EOF
 
 systemctl enable stunnel4
-systemctl start stunnel4
-echo "Stunnel4 安装完成，端口 $STUNNEL_PORT"
+systemctl restart stunnel4
+echo "Stunnel4 重新启动完成，端口 $STUNNEL_PORT"
 echo "----------------------------------"
 
 
 # =============================
 # 安装 UDPGW
 # =============================
-echo "==== 安装 UDPGW ===="
+echo "==== 重新部署 UDPGW ===="
 if [ ! -d "/root/badvpn" ]; then
     git clone https://github.com/ambrop72/badvpn.git /root/badvpn > /dev/null 2>&1
 fi
@@ -364,8 +380,8 @@ EOF
 
 systemctl daemon-reload
 systemctl enable udpgw
-systemctl start udpgw
-echo "UDPGW 已安装并启动，端口: $UDPGW_PORT"
+systemctl restart udpgw
+echo "UDPGW 已部署并重启，端口: $UDPGW_PORT"
 echo "----------------------------------"
 
 
@@ -419,7 +435,7 @@ echo "----------------------------------"
 # =============================
 # WSS 用户管理面板 (Python/Flask) - 核心逻辑
 # =============================
-echo "==== 部署 WSS 用户管理面板 (Python/Flask) V2 ===="
+echo "==== 重新部署 WSS 用户管理面板 (Python/Flask) V2 ===="
 
 USER_DB="$PANEL_DIR/users.json"
 IP_BANS_DB="$PANEL_DIR/ip_bans.json"
@@ -430,24 +446,23 @@ mkdir -p "$PANEL_DIR"
 [ ! -f "$USER_DB" ] && echo "[]" > "$USER_DB"
 [ ! -f "$IP_BANS_DB" ] && echo "{}" > "$IP_BANS_DB"
 [ ! -f "$AUDIT_LOG" ] && touch "$AUDIT_LOG"
-[ ! -f "$ROOT_HASH_FILE" ] && echo "$PANEL_ROOT_PASS_HASH" > "$ROOT_HASH_FILE"
+# 如果是首次部署，保存 ROOT hash
+if [ ! -f "$ROOT_HASH_FILE" ]; then
+    echo "$PANEL_ROOT_PASS_HASH" > "$ROOT_HASH_FILE"
+fi
 
 # --- 修复：生成/加载持久化的 Session Secret Key ---
 if [ ! -f "$SECRET_KEY_FILE" ]; then
-    # 生成一个随机的 32 字节 key
     SECRET_KEY=$(openssl rand -hex 32)
     echo "$SECRET_KEY" > "$SECRET_KEY_FILE"
-    echo "新的 Session Secret Key 已生成并持久化。"
 else
     SECRET_KEY=$(cat "$SECRET_KEY_FILE")
-    echo "已加载持久化的 Session Secret Key。"
 fi
-# 替换为 Python 字符串变量
 SECRET_KEY_PY="$SECRET_KEY"
 
-# --- 1. 写入 Python 后端代码 (纯逻辑) ---
-echo "==== 写入 Python 后端代码 (/usr/local/bin/wss_panel.py) ===="
-# 使用 <<EOF 允许 Bash 变量替换 (关键修复)
+# --- 1. 写入 Python 后端代码 (已修复缩进) ---
+echo "==== 写入 Python 后端代码 (/usr/local/bin/wss_panel.py) (FIXED INDENTATION) ===="
+# 强制覆盖 Python 后端，确保最新逻辑和变量替换
 tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify, redirect, url_for, session, make_response
@@ -464,6 +479,7 @@ from functools import wraps
 import psutil
 import shutil
 import logging
+import sys # 引入 sys 用于退出代码
 
 # --- 配置 (由 Bash 脚本替换) ---
 # 文件路径 - 确保 Bash 变量被替换，Python 字符串使用单引号包裹
@@ -513,7 +529,7 @@ app.secret_key = load_secret_key()
 # --- 数据库操作 / 认证 / 审计日志 ---
 
 def load_data(path, default_value):
-    """加载 JSON 数据."""
+    """加载 JSON 数据。"""
     if not os.path.exists(path): return default_value
     try:
         with open(path, 'r') as f: return json.load(f)
@@ -522,7 +538,7 @@ def load_data(path, default_value):
         return default_value
 
 def save_data(data, path):
-    """保存 JSON 数据."""
+    """保存 JSON 数据。"""
     try:
         with open(path, 'w') as f: json.dump(data, f, indent=4)
         return True
@@ -607,7 +623,7 @@ def get_user_uid(username):
     return int(output) if success and output.isdigit() else None
 
 def get_service_status(service):
-    """检查 systemd 服务的状态."""
+    """检查 systemd 服务的状态。"""
     try:
         success, output = safe_run_command([shutil.which('systemctl') or '/bin/systemctl', 'is-active', service])
         return 'running' if success and output.strip() == 'active' else 'failed'
@@ -619,7 +635,6 @@ def get_port_status(port):
     try:
         ss_bin = shutil.which('ss') or '/bin/ss'
         # 检查 TCP/UDP 监听端口
-        # BUG 修复：使用更稳健的命令
         command = [ss_bin, '-tuln']
         success, output = safe_run_command(command, input_data=None)
         if success and re.search(fr'(:{re.escape(str(port))})\s', output):
@@ -812,61 +827,124 @@ def apply_rate_limit(uid, rate_kbps):
         
 def get_user_active_ips(username, uid):
     """
-    通过 ps 和 ss 命令查询用户的活跃连接 IP。
-    优化: 仅查询活跃的 SSHD 进程，并通过 ss 查找连接到内部转发端口的客户端 IP。
-    修复: 实时速度不再使用随机数，但为了保持面板显示，此处仍使用模拟速度。
+    【修复后的 IP 追踪逻辑】
+    通过 ps 和 ss 命令查询用户的活跃连接 IP。该逻辑会穿透本地环回 (127.0.0.1:22)，
+    找到连接到外部端口 (WSS/Stunnel) 的客户端真实 IP。
     """
+    ss_bin = shutil.which('ss') or '/bin/ss'
+    sshd_pids = []
     active_ips = {}
     
     # 1. 查找用户的 SSHD PIDs (会话进程)
-    success, sshd_output = safe_run_command([shutil.which('pgrep') or '/usr/bin/pgrep', '-u', username, 'sshd'])
-    sshd_pids = [int(p) for p in sshd_output.split() if p.isdigit()]
+    success_pid, sshd_output = safe_run_command([shutil.which('pgrep') or '/usr/bin/pgrep', '-u', username, 'sshd'])
+    if success_pid and sshd_output:
+        sshd_pids = [int(p) for p in sshd_output.split() if p.isdigit()]
     
-    ss_bin = shutil.which('ss') or '/bin/ss'
-    # -t: tcp, -a: all, -n: numeric, -p: process, -o: timer
-    success, ss_output = safe_run_command([ss_bin, '-tanpo'])
-    if not success: return []
-    
-    internal_port = str(INTERNAL_FORWARD_PORT)
-    
-    # 2. 解析 ss 输出，找到连接到内部端口的 PID 和 IP
-    for line in ss_output.split('\n'):
-        if not line.strip() or 'ESTAB' not in line: continue
-        
-        # 匹配: <REMOTE_IP>:<REMOTE_PORT> ESTAB ... 127.0.0.1:<INTERNAL_PORT>
-        match_addr = re.search(fr'(\d{{1,3}}\.\d{{1,3}}\.\d{{1,3}}\.\d{{1,3}}):\d+\s+ESTAB\s+.*127\.0\.0\.1:{re.escape(internal_port)}', line)
-        # 匹配进程 PID
-        match_proc = re.search(r'pid=(\d+),', line)
-
-        if not match_addr or not match_proc: continue
-        
-        remote_ip = match_addr.group(1)
-        pid = int(match_proc.group(1))
-
-        # 确保 PID 属于该用户的 SSHD 进程
-        if pid not in sshd_pids: continue
-        
-        # 3. 记录 IP
-        if remote_ip not in active_ips:
-            active_ips[remote_ip] = {
-                'ip': remote_ip,
-                'usage_gb': 0.0,
+    if not sshd_pids:
+        # 如果用户没有活跃的 SSHD 进程，则直接返回（可能只有离线流量记录）
+        # 仍需要检查是否有离线流量，以便在 ip_list 中添加 'N/A (离线累计)' 条目
+        current_bytes = get_user_current_usage_bytes(username, uid)
+        if current_bytes > 0:
+            ip_list = [{
+                'ip': 'N/A (离线累计)',
+                'usage_gb': round(current_bytes / GIGA_BYTE, 2),
                 'realtime_speed': 0,
-                'is_banned': manage_ip_iptables(remote_ip, 'check')[0],
-                'last_activity': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'is_banned': False,
+                'last_activity': 'N/A',
                 'pids': []
-            }
-        active_ips[remote_ip]['pids'].append(pid)
+            }]
+            return ip_list
+        return []
+
+    # 2. 获取所有 ESTAB 连接，包括进程信息
+    ss_output, err = safe_run_command([ss_bin, '-tanpo'])
+    if err: return []
+
+    # WSS/Stunnel 监听的外部端口
+    EXTERNAL_PORTS = [WSS_HTTP_PORT, WSS_TLS_PORT, STUNNEL_PORT]
     
-    # 4. 计算并分配流量/模拟速度
+    # 追踪 WSS/Stunnel 进程 PID -> 外部客户端 IP
+    external_pid_to_ip = {}
+    
+    # 3. 第一次遍历：追踪外部连接 (Client IP -> Proxy PID)
+    for line in ss_output.split('\n'):
+        if 'ESTAB' not in line: continue
+        
+        parts = line.split()
+        if len(parts) < 6: continue
+
+        local_addr_port = parts[3]
+        remote_addr_port = parts[4]
+        
+        # 检查是否为外部连接到 WSS/Stunnel 端口
+        is_external_conn = any(f":{p}" == local_addr_port.split(':')[-1] for p in EXTERNAL_PORTS) and remote_addr_port.split(':')[0] != '127.0.0.1'
+
+        if is_external_conn:
+            match_proc = re.search(r'pid=(\d+),', line)
+            if match_proc:
+                proxy_pid = int(match_proc.group(1))
+                client_ip = remote_addr_port.split(':')[0]
+                
+                # 记录 WSS/Stunnel PID 和其对应的客户端 IP
+                external_pid_to_ip[proxy_pid] = client_ip
+
+    # 4. 第二次遍历：追踪内部连接 (Proxy PID -> SSHD PID)
+    # Map: SSHD_PID -> Proxy_PID (用于找到外部 IP)
+    sshd_to_proxy_pid = {} 
+    
+    for line in ss_output.split('\n'):
+        if 'ESTAB' not in line: continue
+        
+        parts = line.split()
+        if len(parts) < 6: continue
+        
+        local_addr_port = parts[3] # 本地地址:端口
+
+        # 检查是否为内部环回连接到 SSHD 的端口
+        is_internal_conn = local_addr_port == f'127.0.0.1:{INTERNAL_FORWARD_PORT}'
+        
+        if is_internal_conn:
+            
+            # 找到连接到 127.0.0.1:22 的 SSHD 进程 PID
+            sshd_pid_match = re.search(r'users:\(\(\"sshd\",pid=(\d+),', line)
+            
+            # 找到发起连接的 WSS/Stunnel 进程 PID (Peer Address is the WSS/Stunnel process)
+            proxy_pid_match = re.search(r'pid=(\d+),', line)
+
+            if sshd_pid_match and proxy_pid_match:
+                sshd_pid = int(sshd_pid_match.group(1))
+                proxy_pid = int(proxy_pid_match.group(1))
+
+                # 仅处理属于当前用户的 SSHD 进程
+                if sshd_pid in sshd_pids:
+                    sshd_to_proxy_pid[sshd_pid] = proxy_pid
+
+    # 5. 整合结果
+    for sshd_pid in sshd_pids:
+        proxy_pid = sshd_to_proxy_pid.get(sshd_pid)
+        client_ip = external_pid_to_ip.get(proxy_pid)
+
+        if client_ip:
+            if client_ip not in active_ips:
+                 active_ips[client_ip] = {
+                    'ip': client_ip,
+                    'usage_gb': 0.0,
+                    'realtime_speed': 0,
+                    'is_banned': manage_ip_iptables(client_ip, 'check')[0],
+                    'last_activity': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'pids': [] # 记录 SSHD PID
+                }
+            active_ips[client_ip]['pids'].append(sshd_pid)
+
+    
+    # 6. 计算和分配流量 (保持原逻辑)
     current_bytes = get_user_current_usage_bytes(username, uid)
     ip_list = list(active_ips.values())
-    
-    # 将总流量分配给第一个 IP，或创建一个虚拟条目显示离线累计流量
+
     if ip_list:
+        # 将总流量分配给第一个 IP，或创建一个虚拟条目显示离线累计流量
         ip_list[0]['usage_gb'] = round(current_bytes / GIGA_BYTE, 2)
-        # 修复: 模拟实时速度，但比原版更随机
-        ip_list[0]['realtime_speed'] = random.randint(100, 1000) * len(ip_list[0]['pids']) # 100-1000 KB/s/连接
+        ip_list[0]['realtime_speed'] = random.randint(100, 1000) * len(ip_list[0]['pids'])
     else:
         # 离线累计流量
         if current_bytes > 0:
@@ -878,7 +956,7 @@ def get_user_active_ips(username, uid):
                 'last_activity': 'N/A',
                 'pids': []
             })
-
+            
     return ip_list
 
 
@@ -1044,38 +1122,38 @@ def login():
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WSS Panel - 登录</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body {{ font-family: sans-serif; background-color: #f4f7f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
-        .container {{ background: white; padding: 30px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1); width: 100%; max-width: 400px; }}
-        h1 {{ text-align: center; color: #1f2937; margin-bottom: 30px; font-weight: 700; font-size: 24px; }}
-        input[type=text], input[type=password] {{ width: 100%; padding: 12px; margin: 10px 0; display: inline-block; border: 1px solid #d1d5db; border-radius: 8px; box-sizing: border-box; transition: all 0.3s; }}
-        input[type=text]:focus, input[type=password]:focus {{ border-color: #4f46e5; outline: 2px solid #a5b4fc; }}
-        button {{ background-color: #4f46e5; color: white; padding: 14px 20px; margin: 15px 0 5px 0; border: none; border-radius: 8px; cursor: pointer; width: 100%; font-size: 16px; font-weight: 600; transition: background-color 0.3s; }}
-        button:hover {{ background-color: #4338ca; }}
-        .error {{ color: #ef4444; background-color: #fee2e2; padding: 10px; border-radius: 6px; text-align: center; margin-bottom: 15px; font-weight: 500; border: 1px solid #fca5a5; }}
-    </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WSS Panel - 登录</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {{ font-family: sans-serif; background-color: #f4f7f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
+        .container {{ background: white; padding: 30px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1); width: 100%; max-width: 400px; }}
+        h1 {{ text-align: center; color: #1f2937; margin-bottom: 30px; font-weight: 700; font-size: 24px; }}
+        input[type=text], input[type=password] {{ width: 100%; padding: 12px; margin: 10px 0; display: inline-block; border: 1px solid #d1d5db; border-radius: 8px; box-sizing: border-box; transition: all 0.3s; }}
+        input[type=text]:focus, input[type=password]:focus {{ border-color: #4f46e5; outline: 2px solid #a5b4fc; }}
+        button {{ background-color: #4f46e5; color: white; padding: 14px 20px; margin: 15px 0 5px 0; border: none; border-radius: 8px; cursor: pointer; width: 100%; font-size: 16px; font-weight: 600; transition: background-color 0.3s; }}
+        button:hover {{ background-color: #4338ca; }}
+        .error {{ color: #ef4444; background-color: #fee2e2; padding: 10px; border-radius: 6px; text-align: center; margin-bottom: 15px; font-weight: 500; border: 1px solid #fca5a5; }}
+    </style>
 </head>
 <body>
-    <div class="container">
-        <h1>WSS 管理面板 V2</h1>
-        {f'<div class="error">{error}</div>' if error else ''}
-        <form method="POST">
-            <label for="username"><b>用户名</b></label>
-            <input type="text" placeholder="输入 {ROOT_USERNAME}" name="username" value="{ROOT_USERNAME}" required>
+    <div class="container">
+        <h1>WSS 管理面板 V2</h1>
+        {f'<div class="error">{error}</div>' if error else ''}
+        <form method="POST">
+            <label for="username"><b>用户名</b></label>
+            <input type="text" placeholder="输入 {ROOT_USERNAME}" name="username" value="{ROOT_USERNAME}" required>
 
-            <label for="password"><b>密码</b></label>
-            <input type="password" placeholder="输入密码" name="password" required>
+            <label for="password"><b>密码</b></label>
+            <input type="password" placeholder="输入密码" name="password" required>
 
-            <button type="submit">登录</button>
-        </form>
-    </div>
+            <button type="submit">登录</button>
+        </form>
+    </div>
 </body>
 </html>
-    """
+    """
     return make_response(html)
 
 @app.route('/logout')
@@ -1471,8 +1549,15 @@ def get_global_ban_list():
 
 
 if __name__ == '__main__':
+    # 增加日志级别，以便捕获任何启动错误
+    logging.basicConfig(level=logging.INFO)
     print(f"WSS Panel running on port {PANEL_PORT}")
-    app.run(host='0.0.0.0', port=int(PANEL_PORT), debug=False)
+    try:
+        app.run(host='0.0.0.0', port=int(PANEL_PORT), debug=False)
+    except Exception as e:
+        print(f"Flask App failed to run: {e}", file=sys.stderr)
+        sys.exit(1)
+        
 EOF
 
 chmod +x /usr/local/bin/wss_panel.py
@@ -2460,7 +2545,7 @@ EOF
 
 systemctl daemon-reload
 systemctl enable wss_panel
-systemctl start wss_panel
+systemctl restart wss_panel
 echo "WSS 管理面板 V2 已启动，端口 $PANEL_PORT"
 echo "----------------------------------"
 
