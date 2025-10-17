@@ -12,11 +12,9 @@ set -eu
 # 更改：移除复杂且脆弱的 IP 追踪，改为追踪活跃连接数。
 # 新增：面板新增实时活跃连接 IP 列表。
 # FIX: 增强实时 IP 追踪命令的健壮性。
-# FIX: 恢复用户级别的 SSHD 活跃会话/IP 视图 (FINAL IP ASSOCIATION FIX).
 # FIX: 修复 Flask 后端 Python 文件的缩进错误。
-# FIX: 修复前端 JS 模态框打开逻辑 (openSessionInfoModal)。
-# FIX: 修复前端 JS 中 showStatus 的模板字面量语法错误，提高兼容性。
-# UPDATE: 移除会话追踪模态框中的 SSHD 进程 ID 显示。
+# FIX: 修复前端 JS 模态框打开逻辑。
+# UPDATE: 最终版会话追踪：仅显示活跃客户端 IP 列表，移除 PID。
 # ==========================================================
 
 # =============================
@@ -939,7 +937,7 @@ def get_user_sshd_pids(username):
 def get_user_active_sessions_info(username):
     """
     【最终IP关联修复】通过 SSHD PID 查找其关联的外部连接 IP。
-    - 忽略 Proxy PID 中间件，直接通过 PID 和外部端口关联。
+    - 策略：使用双重关联，但逻辑更健壮。
     """
     ss_bin = shutil.which('ss') or '/bin/ss'
     EXTERNAL_PORTS_STR = set(str(p) for p in [WSS_HTTP_PORT, WSS_TLS_PORT, STUNNEL_PORT])
@@ -951,22 +949,17 @@ def get_user_active_sessions_info(username):
             'active_ips': []
         }
         
-    # **FIX**：使用 `ss -tanp` 再次尝试关联进程信息
+    # 获取所有 ESTAB 连接的详细信息 (需要 -p 选项来关联 PID)
     success_ss, ss_output = safe_run_command([ss_bin, '-tanp'])
     if not success_ss:
         logging.error(f"ss -tanp failed: {ss_output}")
+        # 即使失败，也返回 PID 列表，但 IP 列表为空
         return {
             'sshd_pids': user_pids,
-            'active_ips': [{'ip': 'N/A (ss failed)', 'is_banned': False}]
+            'active_ips': [] 
         }
         
     active_ips = set()
-    
-    # --- 核心逻辑: 查找用户 PID 拥有的连接，并检查其对端 IP 是否连接到 WSS/Stunnel 端口 ---
-    # 由于 WSS/Stunnel 是代理，用户进程 SSHD 实际上是连接到 WSS/Stunnel 的 Localhost 内部转发端口。
-    # 只有 WSS/Stunnel 进程本身才直接拥有外部连接。
-    # 
-    # 策略：查找所有连接到 WSS/Stunnel 端口的 ESTAB 连接，并检查其 PID (代理 PID) 是否在任何内部 SSHD 连接的对端。
     
     # 1. 查找所有连接到内部 SSH 端口（22）的连接，获取其 Peer PID (Proxy PID)
     proxy_pids_for_user_ssh = set()
@@ -1007,7 +1000,8 @@ def get_user_active_sessions_info(username):
         remote_addr_port = parts[4]
         
         # 匹配 Proxy PID
-        match_proc = re.search(r'users:\(\(\w+,pid=(\d+),', line)
+        # FIX: 使用更宽泛的匹配，查找行尾的 PID 标签
+        match_proc = re.search(r'pid=(\d+)', parts[-1])
 
         if match_proc:
             proxy_pid = int(match_proc.group(1))
@@ -1025,15 +1019,12 @@ def get_user_active_sessions_info(username):
                         
     # 整合结果
     ip_list = []
-    ip_bans = load_ip_bans()
-    banned_ips_list = ip_bans.get(username, [])
-
     for ip in active_ips:
-        is_banned_global, _ = manage_ip_iptables(ip, 'check')
+        is_banned, _ = manage_ip_iptables(ip, 'check')
         
         ip_list.append({
             'ip': ip,
-            'is_banned': is_banned_global # We use global ban status for display
+            'is_banned': is_banned
         })
 
     return {
@@ -1728,7 +1719,7 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             <div id="status-message" class="hidden p-4 mb-6 rounded-xl font-medium border-l-4" role="alert"></div>
 
             <!-- 1. 仪表盘视图 (默认显示) -->
-            <div id="view-dashboard">
+            <div id="view-dashboard" >
                 <!-- 实时系统状态卡片 -->
                 <section class="mb-8">
                     <h2 class="text-xl font-semibold text-gray-700 mb-4">核心基础设施状态</h2>
@@ -1784,7 +1775,7 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
                         <input type="text" id="new-username" placeholder="用户名 (Username)" required
                                 class="md:col-span-2 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
                         <input type="password" id="new-password" placeholder="密码 (Password)" required
-                                class class="md:col-span-2 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                                class="md:col-span-2 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
                         <input type="number" id="expiration-days" value="365" min="1" placeholder="有效期 (天)" required
                                 class="md:col-span-1 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
                         <button type="submit" class="md:col-span-1 bg-green-600 hover:bg-green-700 text-white font-bold py-3 rounded-lg transition duration-200 shadow-md">
@@ -1937,7 +1928,7 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             <h3 class="text-xl font-bold text-gray-800 mb-4 border-b pb-2">用户 <span id="session-modal-username-title" class="text-indigo-600"></span> 活跃 IP</h3>
             
             <div id="session-info-content" class="space-y-4">
-                <div class="text-sm text-gray-600 border-t pt-2">
+                <div class="text-sm text-gray-600 pt-2">
                     <p class="font-bold">关联的外部连接 IP (ESTAB):</p>
                     <!-- IP 列表容器 (保留 ID for rendering) -->
                     <div id="session-ips" class="space-y-1 mt-2">正在加载 IP 信息...</div>
@@ -2290,8 +2281,8 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             
             // 重新渲染模态框内容，确保不显示 PID
             document.getElementById('session-info-content').innerHTML = `
-                <div class="text-sm text-gray-600 border-t pt-2">
-                    <p class="font-bold">活跃会话 IP (ESTAB):</p>
+                <div class="text-sm text-gray-600 pt-2">
+                    <p class="font-bold">关联的外部连接 IP (ESTAB):</p>
                     <div id="session-ips" class="space-y-1 mt-2"></div>
                 </div>
             `;
@@ -2471,7 +2462,7 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             
             // Set loading state with new structure
             document.getElementById('session-info-content').innerHTML = `
-                <div class="text-sm text-gray-600 border-t pt-2">
+                <div class="text-sm text-gray-600 pt-2">
                     <p class="font-bold">关联的外部连接 IP (ESTAB):</p>
                     <div id="session-ips" class="space-y-1 mt-2">正在加载 IP 信息...</div>
                 </div>
