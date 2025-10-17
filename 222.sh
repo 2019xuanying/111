@@ -14,6 +14,7 @@ set -eu
 # FIX: 增强实时 IP 追踪命令的健壮性。
 # FIX: 恢复用户级别的 SSHD 活跃会话/IP 视图。
 # FIX: 修复 Flask 后端 Python 文件的缩进错误。
+# FIX: 修复前端 JS 模态框打开逻辑 (openSessionInfoModal)。
 # ==========================================================
 
 # =============================
@@ -977,7 +978,9 @@ def get_user_active_sessions_info(username):
             
             # 找到作为 initiator 的代理进程 (通常是 Peer Address 侧的 users 标签)
             # 由于 ss -tanp 的 users 标签位置不固定，我们依赖其内容来寻找代理 PID
-            proxy_pid_match = re.search(r'pid=(\d+)', parts[-1]) # 最后一个字段是 Process
+            # 最后一个字段通常是 Process/User info, 包含 pid=X, 但格式不稳定
+            # 这里依赖于 ss -tanp 的输出顺序，parts[-1] 包含 users:((...)) 信息
+            proxy_pid_match = re.search(r'pid=(\d+)', parts[-1]) 
 
             if sshd_pid_match and proxy_pid_match:
                 sshd_pid = int(sshd_pid_match.group(1))
@@ -1002,7 +1005,7 @@ def get_user_active_sessions_info(username):
         local_addr_port = parts[3]
         remote_addr_port = parts[4]
         
-        # 匹配 Proxy PID
+        # 匹配 Proxy PID (通常在 users:((...,pid=X)) 标签内)
         match_proc = re.search(r'users:\(\(\w+,pid=(\d+),', line)
 
         if match_proc:
@@ -1605,7 +1608,8 @@ def get_global_ban_list():
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
-    # 修复了缩进错误，确保其位于文件的顶层
+    # FIX: 确保该块位于顶层，修复缩进错误。
+    # 端口配置应从全局常量中获取，这里只是为了兼容环境变量（尽管 bash 已经处理）
     WSS_HTTP_PORT = os.environ.get('WSS_HTTP_PORT', WSS_HTTP_PORT)
     WSS_TLS_PORT = os.environ.get('WSS_TLS_PORT', WSS_TLS_PORT)
     STUNNEL_PORT = os.environ.get('STUNNEL_PORT', STUNNEL_PORT)
@@ -2452,9 +2456,22 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             openModal('settings-modal');
         }
         
+        // FIX: openSessionInfoModal logic simplified to rely on fetchSessionInfo to open modal
         function openSessionInfoModal(username) {
-            document.getElementById('session-info-content').innerHTML = '<p class="text-gray-500">正在加载会话信息...</p>';
-            fetchSessionInfo(username);
+            document.getElementById('session-modal-username-title').textContent = username;
+            // Set loading state immediately
+            document.getElementById('session-info-content').innerHTML = `
+                <div class="text-sm text-gray-600 border-t pt-2">
+                    <p class="font-bold">活跃 SSHD 进程 (PID):</p>
+                    <div id="session-pids" class="font-mono text-sm">加载中...</div>
+                </div>
+                <div class="text-sm text-gray-600 border-t pt-2">
+                    <p class="font-bold">关联的外部连接 IP (ESTAB):</p>
+                    <div id="session-ips" class="space-y-1">加载中...</div>
+                </div>
+            `;
+            openModal('session-info-modal'); // **FIX: Open modal immediately for better UX**
+            fetchSessionInfo(username); // Start fetching data
         }
 
         async function saveUserSettings() {
