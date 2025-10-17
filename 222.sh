@@ -4,7 +4,7 @@
 set -eu
 
 # ==========================================================
-# WSS 隧道与用户管理面板一键部署脚本 (V2 最终稳定版 - 缩进/IP追踪修复)
+# WSS 隧道与用户管理面板一键部署脚本 (V2 最终稳定版 - IP 追踪修复)
 # ==========================================================
 
 # =============================
@@ -81,7 +81,7 @@ echo "----------------------------------"
 # WSS 核心代理脚本 (修复 SyntaxError)
 # =======================================================================================================================================================================
 echo "==== 重新安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
-# 使用 <<'EOF' 来确保 Python 代码块中不发生任何 Bash 变量替换，除非明确指定。
+# 使用 <<EOF 允许 Bash 变量替换
 tee /usr/local/bin/wss > /dev/null <<EOF
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
@@ -460,8 +460,8 @@ else
 fi
 SECRET_KEY_PY="$SECRET_KEY"
 
-# --- 1. 写入 Python 后端代码 (已修复缩进) ---
-echo "==== 写入 Python 后端代码 (/usr/local/bin/wss_panel.py) (FIXED INDENTATION) ===="
+# --- 1. 写入 Python 后端代码 (已修复缩进和 IP 追踪逻辑) ---
+echo "==== 写入 Python 后端代码 (/usr/local/bin/wss_panel.py) (FIXED INDENTATION & IP TRACING) ===="
 # 强制覆盖 Python 后端，确保最新逻辑和变量替换
 tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
@@ -827,9 +827,8 @@ def apply_rate_limit(uid, rate_kbps):
         
 def get_user_active_ips(username, uid):
     """
-    【修复后的 IP 追踪逻辑】
-    通过 ps 和 ss 命令查询用户的活跃连接 IP。该逻辑会穿透本地环回 (127.0.0.1:22)，
-    找到连接到外部端口 (WSS/Stunnel) 的客户端真实 IP。
+    【最终修复后的 IP 追踪逻辑】
+    通过双重关联机制（SSHD PID -> Proxy PID -> Client IP）来穿透本地环回地址。
     """
     ss_bin = shutil.which('ss') or '/bin/ss'
     sshd_pids = []
@@ -841,11 +840,10 @@ def get_user_active_ips(username, uid):
         sshd_pids = [int(p) for p in sshd_output.split() if p.isdigit()]
     
     if not sshd_pids:
-        # 如果用户没有活跃的 SSHD 进程，则直接返回（可能只有离线流量记录）
-        # 仍需要检查是否有离线流量，以便在 ip_list 中添加 'N/A (离线累计)' 条目
+        # 如果用户没有活跃的 SSHD 进程，则检查离线流量
         current_bytes = get_user_current_usage_bytes(username, uid)
         if current_bytes > 0:
-            ip_list = [{
+            return [{
                 'ip': 'N/A (离线累计)',
                 'usage_gb': round(current_bytes / GIGA_BYTE, 2),
                 'realtime_speed': 0,
@@ -853,20 +851,21 @@ def get_user_active_ips(username, uid):
                 'last_activity': 'N/A',
                 'pids': []
             }]
-            return ip_list
         return []
 
-    # 2. 获取所有 ESTAB 连接，包括进程信息
+    # 2. 获取所有 ESTAB 连接的原始输出
     ss_output, err = safe_run_command([ss_bin, '-tanpo'])
     if err: return []
 
     # WSS/Stunnel 监听的外部端口
     EXTERNAL_PORTS = [WSS_HTTP_PORT, WSS_TLS_PORT, STUNNEL_PORT]
     
-    # 追踪 WSS/Stunnel 进程 PID -> 外部客户端 IP
+    # Map: Proxy PID -> 外部客户端 IP
     external_pid_to_ip = {}
+    # Map: SSHD PID -> Proxy PID (通过内部连接关联)
+    sshd_to_proxy_pid = {}
     
-    # 3. 第一次遍历：追踪外部连接 (Client IP -> Proxy PID)
+    # --- 3. 第一次遍历：追踪外部连接 (Client IP -> Proxy PID) ---
     for line in ss_output.split('\n'):
         if 'ESTAB' not in line: continue
         
@@ -876,8 +875,9 @@ def get_user_active_ips(username, uid):
         local_addr_port = parts[3]
         remote_addr_port = parts[4]
         
-        # 检查是否为外部连接到 WSS/Stunnel 端口
-        is_external_conn = any(f":{p}" == local_addr_port.split(':')[-1] for p in EXTERNAL_PORTS) and remote_addr_port.split(':')[0] != '127.0.0.1'
+        # 检查是否为外部连接到 WSS/Stunnel 端口 (使用 Local Port 匹配)
+        local_port = local_addr_port.split(':')[-1]
+        is_external_conn = local_port in EXTERNAL_PORTS and remote_addr_port.split(':')[0] != '127.0.0.1'
 
         if is_external_conn:
             match_proc = re.search(r'pid=(\d+),', line)
@@ -888,24 +888,20 @@ def get_user_active_ips(username, uid):
                 # 记录 WSS/Stunnel PID 和其对应的客户端 IP
                 external_pid_to_ip[proxy_pid] = client_ip
 
-    # 4. 第二次遍历：追踪内部连接 (Proxy PID -> SSHD PID)
-    # Map: SSHD_PID -> Proxy_PID (用于找到外部 IP)
-    sshd_to_proxy_pid = {} 
-    
+    # --- 4. 第二次遍历：追踪内部连接 (SSHD PID -> Proxy PID) ---
+    # 我们需要找到连接到 22 端口的代理进程 PID
     for line in ss_output.split('\n'):
         if 'ESTAB' not in line: continue
         
         parts = line.split()
         if len(parts) < 6: continue
         
-        local_addr_port = parts[3] # 本地地址:端口
-
-        # 检查是否为内部环回连接到 SSHD 的端口
-        is_internal_conn = local_addr_port == f'127.0.0.1:{INTERNAL_FORWARD_PORT}'
+        # 查找目标是 22 端口的连接 (无论是 127.0.0.1:22 还是其他本地 IP)
+        target_port = local_addr_port.split(':')[-1]
         
-        if is_internal_conn:
+        if target_port == INTERNAL_FORWARD_PORT:
             
-            # 找到连接到 127.0.0.1:22 的 SSHD 进程 PID
+            # 找到连接到 22 端口的 SSHD 进程 PID (sshd is the listener here)
             sshd_pid_match = re.search(r'users:\(\(\"sshd\",pid=(\d+),', line)
             
             # 找到发起连接的 WSS/Stunnel 进程 PID (Peer Address is the WSS/Stunnel process)
@@ -942,7 +938,7 @@ def get_user_active_ips(username, uid):
     ip_list = list(active_ips.values())
 
     if ip_list:
-        # 将总流量分配给第一个 IP，或创建一个虚拟条目显示离线累计流量
+        # 将总流量分配给第一个 IP
         ip_list[0]['usage_gb'] = round(current_bytes / GIGA_BYTE, 2)
         ip_list[0]['realtime_speed'] = random.randint(100, 1000) * len(ip_list[0]['pids'])
     else:
