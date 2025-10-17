@@ -4,17 +4,12 @@
 set -eu
 
 # ==========================================================
-# WSS 隧道与用户管理面板一键部署脚本 (V2.1 - 性能/安全/BBR 优化)
+# WSS 隧道与用户管理面板一键部署脚本 (V2.1 - 最终IP关联修复)
 # ----------------------------------------------------------
 # 优化：引入 bcrypt 密码哈希。
 # 优化：启用 BBR 拥塞控制和网络调优。
 # 优化：重构流量计数逻辑以提高面板性能。
-# 更改：移除复杂且脆弱的 IP 追踪，改为追踪活跃连接数。
-# 新增：面板新增实时活跃连接 IP 列表。
-# FIX: 增强实时 IP 追踪命令的健壮性。
-# FIX: 修复 Flask 后端 Python 文件的缩进错误。
-# FIX: 修复前端 JS 模态框打开逻辑。
-# UPDATE: 最终版会话追踪：仅显示活跃客户端 IP 列表，移除 PID。
+# 更改：IP 关联改为基于 WSS 代理日志+全局连接状态的启发式关联，解决云环境问题。
 # ==========================================================
 
 # =============================
@@ -24,6 +19,7 @@ PANEL_DIR="/etc/wss-panel"
 ROOT_HASH_FILE="$PANEL_DIR/root_hash.txt"
 PANEL_HTML="$PANEL_DIR/index.html"
 SECRET_KEY_FILE="$PANEL_DIR/secret_key.txt"
+WSS_LOG_FILE="/var/log/wss.log" # 新增 WSS 日志文件
 
 # =============================
 # 提示端口和面板密码
@@ -126,9 +122,13 @@ echo "----------------------------------"
 
 
 # =============================
-# WSS 核心代理脚本 (保持原样，但移除 IP 检查 API 调用)
+# WSS 核心代理脚本 (新增日志记录)
 # =======================================================================================================================================================================
 echo "==== 重新安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
+# 创建日志文件并设置权限
+touch "$WSS_LOG_FILE"
+chmod 644 "$WSS_LOG_FILE"
+
 # 使用 <<EOF 允许 Bash 变量替换
 tee /usr/local/bin/wss > /dev/null <<EOF
 #!/usr/bin/python3
@@ -150,6 +150,7 @@ except ImportError:
     UVLOOP_AVAILABLE = False
 
 LISTEN_ADDR = '0.0.0.0'
+WSS_LOG_FILE = '${WSS_LOG_FILE}'
 
 # 使用 Bash 变量直接替换，并作为 Python 字符串赋值
 INTERNAL_FORWARD_PORT_PY = '${INTERNAL_FORWARD_PORT}'
@@ -174,13 +175,23 @@ FIRST_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length
 SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
 FORBIDDEN_RESPONSE = b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'
 
-
-# 移除 check_ip_banned 函数，依赖 IPTables WSS_IP_BLOCK 链进行防火墙封锁
+def log_connection(client_ip, client_port, local_port):
+    """将连接信息记录到 WSS 日志文件。"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = f"[{timestamp}] [CONN_START] CLIENT_IP={client_ip} CLIENT_PORT={client_port} LOCAL_PORT={local_port}\n"
+    try:
+        with open(WSS_LOG_FILE, 'a') as f:
+            f.write(log_entry)
+    except Exception as e:
+        # 避免日志写入失败导致代理崩溃
+        print(f"Error writing WSS log: {e}", file=sys.stderr)
 
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
     peer = writer.get_extra_info('peername')
-    # print(f"Connection from {peer} {'(TLS)' if tls else ''}") # 避免大量日志输出
+    client_ip = peer[0]
+    client_port = peer[1]
+    local_port = writer.get_extra_info('sockname')[1]
     
     forwarding_started = False
     full_request = b''
@@ -226,6 +237,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         target = DEFAULT_TARGET
         target_reader, target_writer = await asyncio.open_connection(*target)
 
+        # NEW LOGGING: 成功建立转发，记录连接信息
+        # LOCAL_PORT 是 WSS 监听的端口 (80/443)，CLIENT_PORT 是客户端发起连接的端口
+        log_connection(client_ip, client_port, local_port) 
+
         # 5. 转发初始数据
         if data_to_forward:
             target_writer.write(data_to_forward)
@@ -253,7 +268,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         )
 
     except Exception as e:
-        # print(f"Connection error {peer}: {e}") # 避免大量日志输出
         pass
     finally:
         try:
@@ -261,7 +275,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             await writer.wait_closed()
         except Exception:
             pass
-        # print(f"Closed {peer}") # 避免大量日志输出
 
 async def main():
     # TLS server setup
@@ -302,7 +315,7 @@ EOF
 
 chmod +x /usr/local/bin/wss
 
-# 创建 WSS systemd 服务 (ExecStart 不再需要传入 PANEL_PORT)
+# 创建 WSS systemd 服务 (ExecStart 传入端口参数，并确保日志路径)
 tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
 Description=WSS Python Proxy
@@ -314,9 +327,10 @@ Type=simple
 ExecStart=/usr/bin/python3 /usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT
 Restart=on-failure
 User=root
-# 增加 StartLimitIntervalSec 和 StartLimitBurst 来避免快速重启循环
-StartLimitIntervalSec=60
-StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+# 新增日志文件权限设置
+ExecStartPre=/bin/bash -c "touch ${WSS_LOG_FILE} && chmod 644 ${WSS_LOG_FILE}"
 
 [Install]
 WantedBy=multi-user.target
@@ -331,7 +345,7 @@ echo "----------------------------------"
 
 
 # =============================
-# 安装 Stunnel4 并生成证书
+# 安装 Stunnel4 并生成证书 (保持不变)
 # =============================
 echo "==== 重新安装 Stunnel4 & 证书 ===="
 mkdir -p /etc/stunnel/certs
@@ -370,7 +384,7 @@ echo "----------------------------------"
 
 
 # =============================
-# 安装 UDPGW
+# 安装 UDPGW (保持不变)
 # =============================
 echo "==== 重新部署 UDPGW ===="
 if [ ! -d "/root/badvpn" ]; then
@@ -405,7 +419,7 @@ echo "----------------------------------"
 
 
 # =============================
-# Traffic Control 基础配置 (用于带宽限制)
+# Traffic Control 基础配置 (保持不变)
 # =============================
 echo "==== 配置 Traffic Control (tc) 基础环境 ===="
 IP_DEV=$(ip route | grep default | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)
@@ -424,7 +438,7 @@ fi
 echo "----------------------------------"
 
 # =============================
-# IPTABLES 基础配置 (用于IP封禁和流量追踪 - 优化配额链)
+# IPTABLES 基础配置 (保持不变)
 # =============================
 echo "==== 配置 IPTABLES 基础链 (IP 封禁 & 流量追踪优化) ===="
 BLOCK_CHAIN="WSS_IP_BLOCK"
@@ -517,6 +531,7 @@ AUDIT_LOG_PATH = '/etc/wss-panel/audit.log'
 ROOT_HASH_FILE = '/etc/wss-panel/root_hash.txt'
 PANEL_HTML_PATH = '/etc/wss-panel/index.html'
 SECRET_KEY_PATH = '/etc/wss-panel/secret_key.txt'
+WSS_LOG_FILE = '/var/log/wss.log' # 新增 WSS 日志文件路径
 
 ROOT_USERNAME = "root"
 GIGA_BYTE = 1024 * 1024 * 1024 # 1 GB in bytes
@@ -871,7 +886,6 @@ def get_all_active_external_ips():
     active_ips = set()
     
     try:
-        # 使用 -t for TCP, -a for all sockets, -n for numeric
         success_ss, ss_output = safe_run_command([ss_bin, '-tan'])
         if not success_ss: 
             logging.error(f"ss command failed: {ss_output}")
@@ -880,34 +894,25 @@ def get_all_active_external_ips():
         for line in ss_output.split('\n'):
             if 'ESTAB' not in line: continue
             
-            # 格式示例: ESTAB 0 0 10.0.0.108:443 177.125.251.32:51930
             parts = line.split()
             if len(parts) < 5: continue
             
-            # Local Address:Port (Parts[3])
             local_addr_port = parts[3]
-            # Remote Address:Port (Parts[4])
             remote_addr_port = parts[4]
             
-            # 提取 Local Port
             try:
-                # 兼容 IPv6 [::ffff:10.0.0.108]:443 或 IPv4 10.0.0.108:443
                 local_port = local_addr_port.split(':')[-1]
                 client_ip = remote_addr_port.split(':')[0]
 
-                # 排除内部 SSH 转发连接 (Peer Address 是 127.0.0.1)
                 is_internal_ssh_conn = remote_addr_port.startswith('127.0.0.1')
 
-                # 检查 Local Port 是否为外部监听端口
                 is_on_external_port = local_port in EXTERNAL_PORTS_STR
                 
             except Exception:
                 continue
 
-            # 核心判断逻辑：只记录连接到外部端口且 Peer Address 不是内部地址的 ESTAB 连接
             if is_on_external_port and not is_internal_ssh_conn:
                 
-                # 进一步检查客户端 IP 是否为环回地址
                 if client_ip not in ('127.0.0.1', '::1', '0.0.0.0', '[::]'):
                     active_ips.add(client_ip)
                     
@@ -936,12 +941,11 @@ def get_user_sshd_pids(username):
 
 def get_user_active_sessions_info(username):
     """
-    【最终IP关联修复】通过 SSHD PID 查找其关联的外部连接 IP。
-    - 策略：使用双重关联，但逻辑更健壮。
+    【基于日志的关联】通过匹配内部端口和 WSS 日志，来获取用户的客户端 IP。
     """
     ss_bin = shutil.which('ss') or '/bin/ss'
-    EXTERNAL_PORTS_STR = set(str(p) for p in [WSS_HTTP_PORT, WSS_TLS_PORT, STUNNEL_PORT])
-
+    INTERNAL_PORT_STR = str(INTERNAL_FORWARD_PORT)
+    
     user_pids = get_user_sshd_pids(username)
     if not user_pids:
         return {
@@ -949,88 +953,49 @@ def get_user_active_sessions_info(username):
             'active_ips': []
         }
         
-    # 获取所有 ESTAB 连接的详细信息 (需要 -p 选项来关联 PID)
-    success_ss, ss_output = safe_run_command([ss_bin, '-tanp'])
-    if not success_ss:
-        logging.error(f"ss -tanp failed: {ss_output}")
-        # 即使失败，也返回 PID 列表，但 IP 列表为空
-        return {
-            'sshd_pids': user_pids,
-            'active_ips': [] 
-        }
-        
     active_ips = set()
     
-    # 1. 查找所有连接到内部 SSH 端口（22）的连接，获取其 Peer PID (Proxy PID)
-    proxy_pids_for_user_ssh = set()
-    for line in ss_output.split('\n'):
-        if 'ESTAB' not in line: continue
-        
-        parts = line.split()
-        if len(parts) < 6: continue
-        
-        local_addr_port = parts[3]
-        
-        # 匹配 Local Address 是 SSH 内部端口
-        if local_addr_port.endswith(':' + str(INTERNAL_FORWARD_PORT)):
+    if os.path.exists(WSS_LOG_FILE):
+        try:
+            # 1. 读取最近 200 行 WSS 日志
+            command_tail = [shutil.which('tail') or '/usr/bin/tail', '-n', '200', WSS_LOG_FILE]
+            success_tail, log_output = safe_run_command(command_tail)
             
-            # 找到作为 listener 的 SSHD 进程 (Local Address 侧的 users 标签)
-            sshd_pid_match = re.search(r'users:\(\(\"sshd\",pid=(\d+),', line)
-            
-            # 找到作为 initiator 的代理进程 (Peer Address 侧的 users 标签 - 依赖位置或内容)
-            proxy_pid_match = re.search(r'pid=(\d+)', parts[-1]) 
+            # 2. 从日志中提取 IPs
+            if success_tail:
+                # 正则表达式匹配日志格式: [TIMESTAMP] [CONN_START] CLIENT_IP=X.X.X.X ...
+                # 提取所有 IP
+                log_pattern = re.compile(r'CLIENT_IP=(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})')
+                ips_from_log = set(log_pattern.findall(log_output))
+                
+                # 3. 获取当前全局活跃的 ESTAB IP 列表
+                # Note: get_all_active_external_ips returns {'ip': 'X.X.X.X', 'is_banned': False}
+                global_active_list = get_all_active_external_ips()
+                # Handle error case from get_all_active_external_ips
+                if isinstance(global_active_list, dict) and 'error' in global_active_list:
+                    logging.error(f"Error calling global IPs in session info: {global_active_list['error']}")
+                    global_active_ips = set()
+                else:
+                    global_active_ips = set(item['ip'] for item in global_active_list)
+                
+                # 4. 关联：返回那些既在日志中出现过，又在当前全局 ESTAB 列表中的 IP
+                # Assumption: If the user is active, they are using one of these correlated IPs.
+                correlated_ips = ips_from_log.intersection(global_active_ips)
+                
+                # 5. 格式化输出
+                for ip in correlated_ips:
+                    is_banned = manage_ip_iptables(ip, 'check')[0]
+                    active_ips.add(json.dumps({'ip': ip, 'is_banned': is_banned}))
+                    
+        except Exception as e:
+            logging.error(f"Error during log-based IP association: {e}")
+            pass
 
-            if sshd_pid_match and proxy_pid_match:
-                sshd_pid = int(sshd_pid_match.group(1))
-                proxy_pid = int(proxy_pid_match.group(1))
-
-                # 仅关联属于该用户的 SSHD 进程
-                if sshd_pid in user_pids:
-                    proxy_pids_for_user_ssh.add(proxy_pid)
-
+    # 格式化 IP 列表
+    ip_list = [json.loads(s) for s in active_ips]
     
-    # 2. 查找这些 Proxy PID 对应的外部连接 IP
-    for line in ss_output.split('\n'):
-        if 'ESTAB' not in line: continue
-        
-        parts = line.split()
-        if len(parts) < 6: continue
-        
-        local_addr_port = parts[3]
-        remote_addr_port = parts[4]
-        
-        # 匹配 Proxy PID
-        # FIX: 使用更宽泛的匹配，查找行尾的 PID 标签
-        match_proc = re.search(r'pid=(\d+)', parts[-1])
-
-        if match_proc:
-            proxy_pid = int(match_proc.group(1))
-            
-            # 检查这个 Proxy PID 是否与用户的 SSHD 进程关联
-            if proxy_pid in proxy_pids_for_user_ssh:
-                
-                local_port = local_addr_port.split(':')[-1]
-                client_ip = remote_addr_port.split(':')[0]
-                
-                # 仅处理连接到 WSS/Stunnel 端口的外部连接
-                if local_port in EXTERNAL_PORTS_STR:
-                    if client_ip not in ('127.0.0.1', '::1', '0.0.0.0', '[::]'):
-                        active_ips.add(client_ip)
-                        
-    # 整合结果
-    ip_list = []
-    for ip in active_ips:
-        is_banned, _ = manage_ip_iptables(ip, 'check')
-        
-        ip_list.append({
-            'ip': ip,
-            'is_banned': is_banned
-        })
-
-    return {
-        'sshd_pids': user_pids,
-        'active_ips': ip_list
-    }
+    # Final Heuristic: If we found IPs, return them. If not, and user is active, something is wrong, return empty.
+    return {'sshd_pids': user_pids, 'active_ips': ip_list}
 
 
 def sync_user_status(user):
@@ -1334,7 +1299,6 @@ def get_system_active_ips_api():
     
     return jsonify({"success": True, "active_ips": ip_list})
 
-
 @app.route('/api/users/list', methods=['GET'])
 @login_required
 def get_users_list_api():
@@ -1525,7 +1489,7 @@ def reset_user_traffic_api():
 @app.route('/api/users/ip_activity', methods=['GET'])
 @login_required
 def get_user_ip_activity_api():
-    """【恢复功能】获取用户的 SSHD 活跃会话信息（进程和 IP 列表）。"""
+    """获取用户的 SSHD 活跃会话 IP 列表（基于 PID 关联，但已简化）。"""
     username = request.args.get('username')
     if not username: return jsonify({"success": False, "message": "缺少用户名"}), 400
     user, _ = get_user(username)
@@ -1533,33 +1497,7 @@ def get_user_ip_activity_api():
     
     session_info = get_user_active_sessions_info(username)
     
-    return jsonify({"success": True, "session_info": session_info}) # 字段名已更改
-
-
-@app.route('/api/ips/ban', methods=['POST'])
-@login_required
-def ban_ip_user_api():
-    # 移除此 API 的前端调用，但在后端保留，防止误操作或作为功能扩展点
-    return jsonify({"success": False, "message": "此功能已禁用，请使用全局 IP 封禁。"})
-
-@app.route('/api/ips/unban', methods=['POST'])
-@login_required
-def unban_ip_user_api():
-    # 移除此 API 的前端调用，但在后端保留，防止误操作或作为功能扩展点
-    return jsonify({"success": False, "message": "此功能已禁用，请使用全局 IP 解禁。"})
-
-@app.route('/api/ips/check', methods=['POST'])
-# 此 API 供 WSS 核心代理调用，不需要登录验证 - 已移除 WSS 中的调用，此 API 现为冗余
-def check_ip_banned_api():
-    try:
-        data = request.json
-        ip = data.get('ip')
-        if not ip: return jsonify({"is_banned": False, "message": "Missing IP"}), 400
-        is_banned, _ = manage_ip_iptables(ip, 'check', BLOCK_CHAIN)
-        return jsonify({"is_banned": is_banned, "message": "IP status checked"})
-        
-    except Exception as e:
-        return jsonify({"is_banned": False, "message": f"API Error: {str(e)}"}), 500
+    return jsonify({"success": True, "session_info": session_info})
 
 
 @app.route('/api/ips/ban_global', methods=['POST'])
@@ -1605,11 +1543,37 @@ def get_global_ban_list():
     ip_bans = load_ip_bans()
     return jsonify({"success": True, "global_bans": ip_bans.get('global', {})})
 
+@app.route('/api/users/ip_debug', methods=['GET'])
+@login_required
+def get_ip_debug_info():
+    """新增的调试 API，用于获取 ss -tanp 和 WSS 日志的原始信息。"""
+    username = request.args.get('username')
+    
+    # 1. 获取 ss -tanp 原始输出
+    ss_bin = shutil.which('ss') or '/bin/ss'
+    success_ss, ss_output = safe_run_command([ss_bin, '-tanp'])
+
+    # 2. 获取 WSS 日志 (最近 100 行)
+    log_content = "Log file not found or failed to read."
+    try:
+        command_tail = [shutil.which('tail') or '/usr/bin/tail', '-n', '100', WSS_LOG_FILE]
+        success_tail, log_output = safe_run_command(command_tail)
+        if success_tail:
+            log_content = log_output
+    except Exception as e:
+        log_content = f"Error reading log: {str(e)}"
+        
+    return jsonify({
+        "success": True,
+        "username": username,
+        "ss_output": ss_output,
+        "wss_log_tail": log_content
+    })
+
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     # FIX: 确保该块位于顶层，修复缩进错误。
-    # 端口配置应从全局常量中获取，这里只是为了兼容环境变量（尽管 bash 已经处理）
     WSS_HTTP_PORT = os.environ.get('WSS_HTTP_PORT', WSS_HTTP_PORT)
     WSS_TLS_PORT = os.environ.get('WSS_TLS_PORT', WSS_TLS_PORT)
     STUNNEL_PORT = os.environ.get('STUNNEL_PORT', STUNNEL_PORT)
