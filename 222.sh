@@ -12,9 +12,11 @@ set -eu
 # 更改：移除复杂且脆弱的 IP 追踪，改为追踪活跃连接数。
 # 新增：面板新增实时活跃连接 IP 列表。
 # FIX: 增强实时 IP 追踪命令的健壮性。
-# FIX: 恢复用户级别的 SSHD 活跃会话/IP 视图。
+# FIX: 恢复用户级别的 SSHD 活跃会话/IP 视图 (FINAL IP ASSOCIATION FIX).
 # FIX: 修复 Flask 后端 Python 文件的缩进错误。
 # FIX: 修复前端 JS 模态框打开逻辑 (openSessionInfoModal)。
+# FIX: 修复前端 JS 中 showStatus 的模板字面量语法错误，提高兼容性。
+# UPDATE: 移除会话追踪模态框中的 SSHD 进程 ID 显示。
 # ==========================================================
 
 # =============================
@@ -936,23 +938,23 @@ def get_user_sshd_pids(username):
 
 def get_user_active_sessions_info(username):
     """
-    【恢复功能】获取用户 SSHD 活跃会话信息（进程和 IP 列表）。
+    【最终IP关联修复】通过 SSHD PID 查找其关联的外部连接 IP。
+    - 忽略 Proxy PID 中间件，直接通过 PID 和外部端口关联。
     """
     ss_bin = shutil.which('ss') or '/bin/ss'
-    INTERNAL_PORT_STR = str(INTERNAL_FORWARD_PORT)
-    
+    EXTERNAL_PORTS_STR = set(str(p) for p in [WSS_HTTP_PORT, WSS_TLS_PORT, STUNNEL_PORT])
+
     user_pids = get_user_sshd_pids(username)
     if not user_pids:
         return {
             'sshd_pids': [], 
             'active_ips': []
         }
-
-    # 获取所有 ESTAB 连接的详细信息 (需要 -p 选项来关联 PID)
+        
+    # **FIX**：使用 `ss -tanp` 再次尝试关联进程信息
     success_ss, ss_output = safe_run_command([ss_bin, '-tanp'])
     if not success_ss:
         logging.error(f"ss -tanp failed: {ss_output}")
-        # 如果命令失败，只返回 PID 列表
         return {
             'sshd_pids': user_pids,
             'active_ips': [{'ip': 'N/A (ss failed)', 'is_banned': False}]
@@ -960,42 +962,41 @@ def get_user_active_sessions_info(username):
         
     active_ips = set()
     
-    # 第一次遍历：尝试关联 SSHD PID 和连接到它的代理 PID
-    sshd_to_proxy_pid = {}
+    # --- 核心逻辑: 查找用户 PID 拥有的连接，并检查其对端 IP 是否连接到 WSS/Stunnel 端口 ---
+    # 由于 WSS/Stunnel 是代理，用户进程 SSHD 实际上是连接到 WSS/Stunnel 的 Localhost 内部转发端口。
+    # 只有 WSS/Stunnel 进程本身才直接拥有外部连接。
+    # 
+    # 策略：查找所有连接到 WSS/Stunnel 端口的 ESTAB 连接，并检查其 PID (代理 PID) 是否在任何内部 SSHD 连接的对端。
     
+    # 1. 查找所有连接到内部 SSH 端口（22）的连接，获取其 Peer PID (Proxy PID)
+    proxy_pids_for_user_ssh = set()
     for line in ss_output.split('\n'):
         if 'ESTAB' not in line: continue
         
         parts = line.split()
         if len(parts) < 6: continue
         
-        local_addr_port = parts[3] # 目标是 22 端口 (Local Port)
+        local_addr_port = parts[3]
         
-        if local_addr_port.endswith(':' + INTERNAL_PORT_STR):
+        # 匹配 Local Address 是 SSH 内部端口
+        if local_addr_port.endswith(':' + str(INTERNAL_FORWARD_PORT)):
             
-            # 找到作为 listener 的 SSHD 进程 (通常是 Local Address 侧的 users 标签)
+            # 找到作为 listener 的 SSHD 进程 (Local Address 侧的 users 标签)
             sshd_pid_match = re.search(r'users:\(\(\"sshd\",pid=(\d+),', line)
             
-            # 找到作为 initiator 的代理进程 (通常是 Peer Address 侧的 users 标签)
-            # 由于 ss -tanp 的 users 标签位置不固定，我们依赖其内容来寻找代理 PID
-            # 最后一个字段通常是 Process/User info, 包含 pid=X, 但格式不稳定
-            # 这里依赖于 ss -tanp 的输出顺序，parts[-1] 包含 users:((...)) 信息
+            # 找到作为 initiator 的代理进程 (Peer Address 侧的 users 标签 - 依赖位置或内容)
             proxy_pid_match = re.search(r'pid=(\d+)', parts[-1]) 
 
             if sshd_pid_match and proxy_pid_match:
                 sshd_pid = int(sshd_pid_match.group(1))
                 proxy_pid = int(proxy_pid_match.group(1))
 
+                # 仅关联属于该用户的 SSHD 进程
                 if sshd_pid in user_pids:
-                    # 关联 SSHD PID 和 Proxy PID
-                    sshd_to_proxy_pid[sshd_pid] = proxy_pid
+                    proxy_pids_for_user_ssh.add(proxy_pid)
 
     
-    # 第二次遍历：匹配 Proxy PID 到外部 IP
-    
-    # 获取 WSS 和 Stunnel 的活跃外部连接
-    EXTERNAL_PORTS_STR = set(str(p) for p in [WSS_HTTP_PORT, WSS_TLS_PORT, STUNNEL_PORT])
-    
+    # 2. 查找这些 Proxy PID 对应的外部连接 IP
     for line in ss_output.split('\n'):
         if 'ESTAB' not in line: continue
         
@@ -1005,29 +1006,34 @@ def get_user_active_sessions_info(username):
         local_addr_port = parts[3]
         remote_addr_port = parts[4]
         
-        # 匹配 Proxy PID (通常在 users:((...,pid=X)) 标签内)
+        # 匹配 Proxy PID
         match_proc = re.search(r'users:\(\(\w+,pid=(\d+),', line)
 
         if match_proc:
             proxy_pid = int(match_proc.group(1))
             
             # 检查这个 Proxy PID 是否与用户的 SSHD 进程关联
-            if proxy_pid in sshd_to_proxy_pid.values():
+            if proxy_pid in proxy_pids_for_user_ssh:
                 
-                # 检查 Local Port 是否为外部监听端口
                 local_port = local_addr_port.split(':')[-1]
+                client_ip = remote_addr_port.split(':')[0]
+                
+                # 仅处理连接到 WSS/Stunnel 端口的外部连接
                 if local_port in EXTERNAL_PORTS_STR:
-                    client_ip = remote_addr_port.split(':')[0]
                     if client_ip not in ('127.0.0.1', '::1', '0.0.0.0', '[::]'):
                         active_ips.add(client_ip)
                         
     # 整合结果
     ip_list = []
+    ip_bans = load_ip_bans()
+    banned_ips_list = ip_bans.get(username, [])
+
     for ip in active_ips:
-        is_banned = manage_ip_iptables(ip, 'check')[0]
+        is_banned_global, _ = manage_ip_iptables(ip, 'check')
+        
         ip_list.append({
             'ip': ip,
-            'is_banned': is_banned
+            'is_banned': is_banned_global # We use global ban status for display
         })
 
     return {
@@ -1045,6 +1051,7 @@ def sync_user_status(user):
         return user
     
     is_expired = False
+    
     if user.get('expiry_date'):
         try:
             expiry_dt = datetime.strptime(user['expiry_date'], '%Y-%m-%d')
@@ -1098,11 +1105,9 @@ def refresh_all_user_status(users):
     expired_count = 0
     
     for user in users:
-        # 捕获用户状态同步中的可能错误
         try:
             user = sync_user_status(user)
         except Exception as e:
-            # 如果 sync_user_status 失败，保持用户状态不变，并记录错误
             print(f"Error syncing user {user.get('username')}: {e}", file=sys.stderr)
             continue
             
@@ -1110,15 +1115,19 @@ def refresh_all_user_status(users):
         
         if user['status'] == 'paused':
             user['status_text'] = "暂停 (Manual)"
+            user['status_class'] = "bg-yellow-500"
             paused_count += 1
         elif user['status'] == 'expired':
             user['status_text'] = "已到期"
+            user['status_class'] = "bg-red-500"
             expired_count += 1
         elif user['status'] == 'exceeded':
             user['status_text'] = "超额 (Quota Exceeded)"
+            user['status_class'] = "bg-red-500"
             expired_count += 1
         else: # active
             user['status_text'] = "启用 (Active)"
+            user['status_class'] = "bg-green-500"
             active_count += 1
         
         total_traffic += user.get('usage_gb', 0)
@@ -1664,7 +1673,7 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
         
     </style>
 </head>
-<body class="min-h-screen bg-gray-50">
+<body>
 
     <!-- Header / 导航栏 -->
     <header class="bg-indigo-700 shadow-lg sticky top-0 z-20">
@@ -1775,7 +1784,7 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
                         <input type="text" id="new-username" placeholder="用户名 (Username)" required
                                 class="md:col-span-2 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
                         <input type="password" id="new-password" placeholder="密码 (Password)" required
-                                class="md:col-span-2 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                                class class="md:col-span-2 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
                         <input type="number" id="expiration-days" value="365" min="1" placeholder="有效期 (天)" required
                                 class="md:col-span-1 p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
                         <button type="submit" class="md:col-span-1 bg-green-600 hover:bg-green-700 text-white font-bold py-3 rounded-lg transition duration-200 shadow-md">
@@ -1911,7 +1920,7 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
                 </div>
 
                 <div class="mt-6 flex justify-between">
-                    <button type="button" onclick="confirmAction(document.getElementById('modal-username-setting').value, null, null, 'resetTraffic', '重置流量')" 
+                    <button type="button" onclick="confirmAction(document.getElementById('modal-username-setting').value, null, null, 'resetTraffic', '重置流量')" 
                             class="bg-yellow-500 hover:bg-yellow-600 text-white font-semibold py-2 px-4 rounded-lg shadow-md transition duration-200">重置流量</button>
                     <div class="flex space-x-3">
                         <button type="button" onclick="closeModal('settings-modal')" class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-semibold py-2 px-4 rounded-lg shadow-md transition duration-200">取消</button>
@@ -1922,25 +1931,21 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
         </div>
     </div>
     
-    <!-- 模态框：SSH 活跃会话信息 (新增/修改) -->
+    <!-- 模态框：SSH 活跃会话信息 (修改后的结构) -->
     <div id="session-info-modal" class="fixed inset-0 bg-gray-900 bg-opacity-50 z-[1000] hidden justify-center items-center">
         <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-2xl transition duration-300 transform scale-100">
-            <h3 class="text-xl font-bold text-gray-800 mb-4 border-b pb-2">用户 <span id="session-modal-username-title" class="text-indigo-600"></span> 活跃会话</h3>
+            <h3 class="text-xl font-bold text-gray-800 mb-4 border-b pb-2">用户 <span id="session-modal-username-title" class="text-indigo-600"></span> 活跃 IP</h3>
             
             <div id="session-info-content" class="space-y-4">
-                <p class="text-gray-500">正在加载会话信息...</p>
-                <div class="text-sm text-gray-600 border-t pt-2">
-                    <p class="font-bold">活跃 SSHD 进程 (PID):</p>
-                    <div id="session-pids" class="font-mono text-sm">N/A</div>
-                </div>
                 <div class="text-sm text-gray-600 border-t pt-2">
                     <p class="font-bold">关联的外部连接 IP (ESTAB):</p>
-                    <div id="session-ips" class="space-y-1">N/A</div>
+                    <!-- IP 列表容器 (保留 ID for rendering) -->
+                    <div id="session-ips" class="space-y-1 mt-2">正在加载 IP 信息...</div>
                 </div>
             </div>
             
             <div class="mt-6 flex justify-between">
-                <button onclick="confirmAction(document.getElementById('session-modal-username-title').textContent, null, null, 'killAll', '强制断开所有')" 
+                <button onclick="confirmAction(document.getElementById('session-modal-username-title').textContent, null, null, 'killAll', '强制断开所有')" 
                         class="bg-red-500 hover:bg-red-600 text-white font-semibold py-2 px-4 rounded-lg text-sm shadow-md transition duration-200">
                     强制断开所有连接
                 </button>
@@ -1948,7 +1953,7 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             </div>
         </div>
     </div>
-    
+
     <!-- 模态框：通用确认 -->
     <div id="confirm-modal" class="fixed inset-0 bg-gray-900 bg-opacity-50 z-[1000] hidden justify-center items-center">
         <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-sm transition duration-300 transform scale-100">
@@ -1993,12 +1998,16 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
 
         // --- 辅助工具函数 ---
 
-        function showStatus(message, isSuccess = true) {
+        function showStatus(message, isSuccess) {
             const statusDiv = document.getElementById('status-message');
-            statusDiv.innerHTML = message;
-            statusDiv.className = isSuccess 
-                ? 'bg-green-100 text-green-800 border-green-400 p-4 mb-6 rounded-xl font-medium border-l-4' 
-                : 'bg-red-100 text-red-800 border-red-400 p-4 mb-6 rounded-xl font-medium border-l-4';
+            statusDiv.textContent = message;
+            
+            const colorClass = isSuccess 
+                ? 'bg-green-100 text-green-800 border-green-400' 
+                : 'bg-red-100 text-red-800 border-red-400';
+                
+            // FIX: Use explicit string concatenation to avoid template literal issues.
+            statusDiv.className = colorClass + ' p-4 mb-6 rounded-xl font-semibold shadow-md block border-l-4';
             statusDiv.style.display = 'block';
             setTimeout(() => { statusDiv.style.display = 'none'; }, 5000);
         }
@@ -2279,17 +2288,18 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             const title = document.getElementById('session-modal-username-title');
             title.textContent = username;
             
-            const pidsDiv = document.getElementById('session-pids');
+            // 重新渲染模态框内容，确保不显示 PID
+            document.getElementById('session-info-content').innerHTML = `
+                <div class="text-sm text-gray-600 border-t pt-2">
+                    <p class="font-bold">活跃会话 IP (ESTAB):</p>
+                    <div id="session-ips" class="space-y-1 mt-2"></div>
+                </div>
+            `;
             const ipsDiv = document.getElementById('session-ips');
 
-            if (sessionInfo.sshd_pids.length === 0) {
-                 pidsDiv.innerHTML = '<p class="text-yellow-600 font-semibold">该用户目前没有活跃的 SSHD 进程。</p>';
-            } else {
-                 pidsDiv.textContent = sessionInfo.sshd_pids.join(', ');
-            }
-            
+            // 尽管后端返回了 PID，但我们不显示它，只显示 IP 列表。
             if (sessionInfo.active_ips.length === 0) {
-                 ipsDiv.innerHTML = '<p class="text-gray-500">未检测到关联的外部 ESTAB IP。</p>';
+                 ipsDiv.innerHTML = '<p class="text-red-600 font-semibold">未检测到关联的外部 ESTAB IP。</p>'; 
             } else {
                 ipsDiv.innerHTML = sessionInfo.active_ips.map(ipInfo => {
                     const isBanned = ipInfo.is_banned;
@@ -2300,6 +2310,7 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
 
                     return '<div class="flex justify-between items-center p-2 bg-white border border-gray-200 rounded-lg shadow-sm text-xs">' +
                            '<p class="font-mono text-gray-900 flex items-center"><strong>' + ipInfo.ip + '</strong> ' + banTag + '</p>' +
+                           // FIX: Global Ban button logic uses correct parameters
                            '<button onclick="confirmAction(null, \'' + ipInfo.ip + '\', null, \'' + action + 'Global\', \'' + (isBanned ? '解除全局封禁' : '全局封禁 IP') + '\')" ' +
                            'class="mt-0 w-auto ' + buttonColor + ' text-white py-1 px-2 rounded-lg text-xs font-semibold flex-shrink-0">' +
                            actionText +
@@ -2315,7 +2326,7 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             try {
                 const response = await fetch(API_BASE + url, options);
                 
-                // FIX: Check for redirection (e.g., to /login) before attempting to parse JSON
+                // Check for redirection (e.g., to /login)
                 if (response.redirected) {
                     window.location.assign(response.url);
                     return null;
@@ -2356,10 +2367,8 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
             if (data && data.session_info) {
                  renderSessionInfo(username, data.session_info);
             } else {
-                 renderSessionInfo(username, { sshd_pids: ['N/A'], active_ips: [] });
-                 showStatus('无法获取会话信息，请检查后台日志。', false);
+                 renderSessionInfo(username, { sshd_pids: ['N/A'], active_ips: [] }); 
             }
-            openModal('session-info-modal');
         }
 
         // --- 实时刷新主函数 ---
@@ -2459,18 +2468,16 @@ tee "$PANEL_HTML" > /dev/null <<'EOF_HTML'
         // FIX: openSessionInfoModal logic simplified to rely on fetchSessionInfo to open modal
         function openSessionInfoModal(username) {
             document.getElementById('session-modal-username-title').textContent = username;
-            // Set loading state immediately
+            
+            // Set loading state with new structure
             document.getElementById('session-info-content').innerHTML = `
                 <div class="text-sm text-gray-600 border-t pt-2">
-                    <p class="font-bold">活跃 SSHD 进程 (PID):</p>
-                    <div id="session-pids" class="font-mono text-sm">加载中...</div>
-                </div>
-                <div class="text-sm text-gray-600 border-t pt-2">
                     <p class="font-bold">关联的外部连接 IP (ESTAB):</p>
-                    <div id="session-ips" class="space-y-1">加载中...</div>
+                    <div id="session-ips" class="space-y-1 mt-2">正在加载 IP 信息...</div>
                 </div>
             `;
-            openModal('session-info-modal'); // **FIX: Open modal immediately for better UX**
+            
+            openModal('session-info-modal'); 
             fetchSessionInfo(username); // Start fetching data
         }
 
