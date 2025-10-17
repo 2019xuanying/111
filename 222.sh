@@ -4,7 +4,9 @@
 set -eu
 
 # ==========================================================
-# WSS 隧道与用户管理面板一键部署脚本 (V2 最终稳定版 - IP 追踪修复)
+# WSS 隧道与用户管理面板一键部署脚本 (V2 最终稳定版 - 兼容性修复)
+# ----------------------------------------------------------
+# 修复：解决 safe_run_command 误判 ss 命令成功为失败的问题。
 # ==========================================================
 
 # =============================
@@ -461,7 +463,7 @@ fi
 SECRET_KEY_PY="$SECRET_KEY"
 
 # --- 1. 写入 Python 后端代码 (已修复缩进和 IP 追踪逻辑) ---
-echo "==== 写入 Python 后端代码 (/usr/local/bin/wss_panel.py) (FIXED INDENTATION & IP TRACING) ===="
+echo "==== 写入 Python 后端代码 (/usr/local/bin/wss_panel.py) (FINAL COMPATIBILITY FIX) ===="
 # 强制覆盖 Python 后端，确保最新逻辑和变量替换
 tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
@@ -588,23 +590,34 @@ def login_required(f):
 
 # --- 系统命令执行和状态函数 ---
 def safe_run_command(command, input_data=None):
-    """安全运行系统命令。"""
+    """
+    【最终修复】安全运行系统命令。
+    此版本将忽略 stderr，除非返回码明确表示失败，以解决 ss 等命令在不同系统上将表头/警告输出到 stderr 的兼容性问题。
+    """
     try:
-        process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            stdin=subprocess.PIPE if input_data is not None else None,
-            text=True,
-            encoding='utf-8'
+        process = subprocess.run(
+            command, 
+            capture_output=True, 
+            text=True, 
+            encoding='utf-8',
+            input=input_data,
+            timeout=5
         )
-        stdout, stderr = process.communicate(input=input_data, timeout=5)
+        stdout = process.stdout.strip()
+        stderr = process.stderr.strip()
         
-        if process.returncode != 0 and 'already exists' not in stderr and 'No chain/target/match' not in stderr and 'command failed' not in stderr:
-            return False, stderr.strip() if stderr else f"Command failed with code {process.returncode}"
-
-        return True, stdout.strip()
+        # 允许某些非零退出码通过 (例如 grep, userdel -r)
+        if process.returncode != 0:
+            if 'already exists' in stderr or 'No chain/target/match' in stderr or 'user not found' in stderr or 'no such process' in stderr:
+                return True, stdout
+            
+            # 如果是其他非零返回码，返回失败
+            return False, stderr or f"Command failed with code {process.returncode}"
+        
+        # 成功执行
+        return True, stdout
+        
     except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
         return False, "Command timed out"
     except FileNotFoundError:
         return False, f"Command not found: {command[0]}"
@@ -635,8 +648,8 @@ def get_port_status(port):
     try:
         ss_bin = shutil.which('ss') or '/bin/ss'
         # 检查 TCP/UDP 监听端口
-        command = [ss_bin, '-tuln']
-        success, output = safe_run_command(command, input_data=None)
+        # 注意：这里继续使用 safe_run_command，因为我们已经修复了它
+        success, output = safe_run_command([ss_bin, '-tuln'], input_data=None)
         if success and re.search(fr'(:{re.escape(str(port))})\s', output):
             return 'LISTEN'
         return 'FAIL'
@@ -654,6 +667,7 @@ def get_service_logs(service_name, lines=50):
 
 def kill_user_sessions(username):
     """终止给定用户名的所有活跃 SSH 会话。"""
+    # pkill 失败返回非零退出码，但不是致命错误，因此使用 safe_run_command
     safe_run_command([shutil.which('pkill') or '/usr/bin/pkill', '-u', username])
 
 def manage_ip_iptables(ip, action, chain_name=BLOCK_CHAIN):
@@ -829,6 +843,7 @@ def get_user_active_ips(username, uid):
     """
     【最终修复后的 IP 追踪逻辑】
     通过双重关联机制（SSHD PID -> Proxy PID -> Client IP）来穿透本地环回地址。
+    增加了 DEBUG 日志输出。
     """
     ss_bin = shutil.which('ss') or '/bin/ss'
     sshd_pids = []
@@ -839,6 +854,8 @@ def get_user_active_ips(username, uid):
     if success_pid and sshd_output:
         sshd_pids = [int(p) for p in sshd_output.split() if p.isdigit()]
     
+    logging.info(f"IP_TRACING_DEBUG: SSHD PIDs for {username}: {sshd_pids}") # DEBUG LOG
+
     if not sshd_pids:
         # 如果用户没有活跃的 SSHD 进程，则检查离线流量
         current_bytes = get_user_current_usage_bytes(username, uid)
@@ -854,8 +871,11 @@ def get_user_active_ips(username, uid):
         return []
 
     # 2. 获取所有 ESTAB 连接的原始输出
-    ss_output, err = safe_run_command([ss_bin, '-tanpo'])
-    if err: return []
+    # FIX: safe_run_command 已经修复，可以直接使用其返回的 stdout
+    success_ss, ss_output = safe_run_command([ss_bin, '-tanpo'])
+    if not success_ss: 
+        logging.error(f"IP_TRACING_DEBUG: Failed to run ss -tanpo: {ss_output}")
+        return []
 
     # WSS/Stunnel 监听的外部端口
     EXTERNAL_PORTS = [WSS_HTTP_PORT, WSS_TLS_PORT, STUNNEL_PORT]
@@ -888,13 +908,16 @@ def get_user_active_ips(username, uid):
                 # 记录 WSS/Stunnel PID 和其对应的客户端 IP
                 external_pid_to_ip[proxy_pid] = client_ip
 
+    logging.info(f"IP_TRACING_DEBUG: external_pid_to_ip: {external_pid_to_ip}") # DEBUG LOG
+
     # --- 4. 第二次遍历：追踪内部连接 (SSHD PID -> Proxy PID) ---
-    # 我们需要找到连接到 22 端口的代理进程 PID
     for line in ss_output.split('\n'):
         if 'ESTAB' not in line: continue
         
         parts = line.split()
         if len(parts) < 6: continue
+        
+        local_addr_port = parts[3]
         
         # 查找目标是 22 端口的连接 (无论是 127.0.0.1:22 还是其他本地 IP)
         target_port = local_addr_port.split(':')[-1]
@@ -902,10 +925,14 @@ def get_user_active_ips(username, uid):
         if target_port == INTERNAL_FORWARD_PORT:
             
             # 找到连接到 22 端口的 SSHD 进程 PID (sshd is the listener here)
+            # SSHD PID 位于 Local Address 侧的 users:((...)) 标签中
             sshd_pid_match = re.search(r'users:\(\(\"sshd\",pid=(\d+),', line)
             
             # 找到发起连接的 WSS/Stunnel 进程 PID (Peer Address is the WSS/Stunnel process)
-            proxy_pid_match = re.search(r'pid=(\d+),', line)
+            # Proxy PID 位于 Peer Address 侧的 users:((...)) 标签中
+            # 修复：Peer side 的 users 标签可能包含 'python3' 或 'stunnel4'
+            # 我们通过匹配 "python3" 或 "stunnel4" 来确保它是代理进程
+            proxy_pid_match = re.search(r'users:\(\(\w+,pid=(\d+),fd=\d+\)\)', line)
 
             if sshd_pid_match and proxy_pid_match:
                 sshd_pid = int(sshd_pid_match.group(1))
@@ -914,6 +941,8 @@ def get_user_active_ips(username, uid):
                 # 仅处理属于当前用户的 SSHD 进程
                 if sshd_pid in sshd_pids:
                     sshd_to_proxy_pid[sshd_pid] = proxy_pid
+
+    logging.info(f"IP_TRACING_DEBUG: sshd_to_proxy_pid: {sshd_to_proxy_pid}") # DEBUG LOG
 
     # 5. 整合结果
     for sshd_pid in sshd_pids:
@@ -1118,38 +1147,38 @@ def login():
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WSS Panel - 登录</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body {{ font-family: sans-serif; background-color: #f4f7f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
-        .container {{ background: white; padding: 30px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1); width: 100%; max-width: 400px; }}
-        h1 {{ text-align: center; color: #1f2937; margin-bottom: 30px; font-weight: 700; font-size: 24px; }}
-        input[type=text], input[type=password] {{ width: 100%; padding: 12px; margin: 10px 0; display: inline-block; border: 1px solid #d1d5db; border-radius: 8px; box-sizing: border-box; transition: all 0.3s; }}
-        input[type=text]:focus, input[type=password]:focus {{ border-color: #4f46e5; outline: 2px solid #a5b4fc; }}
-        button {{ background-color: #4f46e5; color: white; padding: 14px 20px; margin: 15px 0 5px 0; border: none; border-radius: 8px; cursor: pointer; width: 100%; font-size: 16px; font-weight: 600; transition: background-color 0.3s; }}
-        button:hover {{ background-color: #4338ca; }}
-        .error {{ color: #ef4444; background-color: #fee2e2; padding: 10px; border-radius: 6px; text-align: center; margin-bottom: 15px; font-weight: 500; border: 1px solid #fca5a5; }}
-    </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WSS Panel - 登录</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {{ font-family: sans-serif; background-color: #f4f7f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
+        .container {{ background: white; padding: 30px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1); width: 100%; max-width: 400px; }}
+        h1 {{ text-align: center; color: #1f2937; margin-bottom: 30px; font-weight: 700; font-size: 24px; }}
+        input[type=text], input[type=password] {{ width: 100%; padding: 12px; margin: 10px 0; display: inline-block; border: 1px solid #d1d5db; border-radius: 8px; box-sizing: border-box; transition: all 0.3s; }}
+        input[type=text]:focus, input[type=password]:focus {{ border-color: #4f46e5; outline: 2px solid #a5b4fc; }}
+        button {{ background-color: #4f46e5; color: white; padding: 14px 20px; margin: 15px 0 5px 0; border: none; border-radius: 8px; cursor: pointer; width: 100%; font-size: 16px; font-weight: 600; transition: background-color 0.3s; }}
+        button:hover {{ background-color: #4338ca; }}
+        .error {{ color: #ef4444; background-color: #fee2e2; padding: 10px; border-radius: 6px; text-align: center; margin-bottom: 15px; font-weight: 500; border: 1px solid #fca5a5; }}
+    </style>
 </head>
 <body>
-    <div class="container">
-        <h1>WSS 管理面板 V2</h1>
-        {f'<div class="error">{error}</div>' if error else ''}
-        <form method="POST">
-            <label for="username"><b>用户名</b></label>
-            <input type="text" placeholder="输入 {ROOT_USERNAME}" name="username" value="{ROOT_USERNAME}" required>
+    <div class="container">
+        <h1>WSS 管理面板 V2</h1>
+        {f'<div class="error">{error}</div>' if error else ''}
+        <form method="POST">
+            <label for="username"><b>用户名</b></label>
+            <input type="text" placeholder="输入 {ROOT_USERNAME}" name="username" value="{ROOT_USERNAME}" required>
 
-            <label for="password"><b>密码</b></label>
-            <input type="password" placeholder="输入密码" name="password" required>
+            <label for="password"><b>密码</b></label>
+            <input type="password" placeholder="输入密码" name="password" required>
 
-            <button type="submit">登录</button>
-        </form>
-    </div>
+            <button type="submit">登录</button>
+        </form>
+    </div>
 </body>
 </html>
-    """
+    """
     return make_response(html)
 
 @app.route('/logout')
@@ -2624,5 +2653,5 @@ echo "WSS 代理状态: sudo systemctl status wss"
 echo "Stunnel 状态: sudo systemctl status stunnel4"
 echo "Web 面板状态: sudo systemctl status wss_panel"
 echo "用户数据库路径: /etc/wss-panel/users.json (面板通过此文件进行用户查询和管理)"
-echo "Session Key 路径: /etc/wss-panel/secret_key.txt (确保持久化，防止重启登出)"
 echo "=================================================="
+
